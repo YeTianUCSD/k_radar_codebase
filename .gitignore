@@ -1,0 +1,42 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Environment / logs
+.env
+*.log
+
+# Large local folders
+visualization/
+pretrained/
+results/
+
+# Exclude all docs and resources
+docs/
+resources/
+
+# revise_label: only keep zip files
+tools/revise_label/*
+!tools/revise_label/*.zip
+
+# Build/cache artifacts, but keep .so
+*.o
+*.obj
+*.egg-info/
+dist/
+
+# Project-specific build folders
+ops/build/
+utils/Rotated_IoU/build/
+
+# Common large generated files
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.npz
+*.npy
+*.tar
+*.tar.gz

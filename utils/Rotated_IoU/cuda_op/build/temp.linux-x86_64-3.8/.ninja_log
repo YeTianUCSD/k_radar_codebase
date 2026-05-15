@@ -1,0 +1,5 @@
+# ninja log v7
+1	24016	1778146976047797165	/home/code/hyperradar/k_radar_codebase/utils/Rotated_IoU/cuda_op/build/temp.linux-x86_64-3.8/sort_vert_kernel.o	a163ff8b07029f83
+0	24508	1778146976046797140	/home/code/hyperradar/k_radar_codebase/utils/Rotated_IoU/cuda_op/build/temp.linux-x86_64-3.8/sort_vert.o	7ce624dc4c74b34a
+388	17474	1778748372677543980	/home/code/hyperradar/k_radar_codebase/utils/Rotated_IoU/cuda_op/build/temp.linux-x86_64-3.8/sort_vert_kernel.o	3cf1216335241849
+387	23901	1778748372676543951	/home/code/hyperradar/k_radar_codebase/utils/Rotated_IoU/cuda_op/build/temp.linux-x86_64-3.8/sort_vert.o	9de4724e3c2d5748
