@@ -42,8 +42,8 @@ def parse_args():
     parser.add_argument('--run_stamp', type=str, default=None,
                         help='Optional YYMMDD_HHMMSS stamp used in the final run directory name.')
 
-    parser.add_argument('--trainable', choices=['head', 'fuser_head', 'full'], default='head',
-                        help='Parameter scope to update online.')
+    parser.add_argument('--trainable', choices=['cls', 'head', 'fuser_head', 'full'], default='head',
+                        help='Parameter scope to update online. cls updates only head.conv_cls; head updates the full detector head.')
     parser.add_argument('--batch_size', type=int, default=1,
                         help='Stream batch size.')
     parser.add_argument('--num_workers', type=int, default=0,
@@ -140,7 +140,13 @@ def set_trainable_scope(network, scope):
         total += param.numel()
 
     enabled = {}
-    if scope == 'head':
+    if scope == 'cls':
+        head = getattr(network, 'head', None)
+        conv_cls = getattr(head, 'conv_cls', None) if head is not None else None
+        if conv_cls is None:
+            raise RuntimeError('Trainable scope cls requires network.head.conv_cls')
+        enabled['head.conv_cls'] = set_module_trainable(conv_cls, True)
+    elif scope == 'head':
         enabled['head'] = set_module_trainable(getattr(network, 'head', None), True)
     elif scope == 'fuser_head':
         enabled['fuser'] = set_module_trainable(getattr(network, 'fuser', None), True)

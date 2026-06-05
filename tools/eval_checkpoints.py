@@ -230,6 +230,8 @@ def main():
     parser.add_argument('--include_best_latest', action='store_true',
                         help='Also evaluate best.checkpoint/latest.checkpoint from checkpoint_dir')
     parser.add_argument('--print_memory', action='store_true')
+    parser.add_argument('--hd_memory', type=str, default=None,
+                        help='Optional HD memory path loaded after each model checkpoint. Use with AnchorHeadSingleHD configs.')
     args = parser.parse_args()
 
     if args.checkpoints is None and args.checkpoint_dir is None:
@@ -275,6 +277,11 @@ def main():
 
             load_time_start = time.time()
             pline.load_dict_model(checkpoint_path)
+            if args.hd_memory is not None:
+                head = getattr(pline.network, 'head', None)
+                if head is None or not hasattr(head, 'hd_core'):
+                    raise RuntimeError('--hd_memory requires a network head with hd_core. Use an HD config.')
+                head.hd_core.load_memory(args.hd_memory, map_location='cpu')
             load_model_time_sec = time.time() - load_time_start
             pline.network.eval()
             shutil.copy2(os.path.realpath(__file__), os.path.join(pline.path_log, 'executed_code.txt'))
@@ -318,6 +325,7 @@ def main():
     write_csv(args.summary_csv, summary_rows)
     write_comparison(args.summary_csv, summary_rows)
     print(f'* Summary saved: {args.summary_csv}')
+    os._exit(0)
 
 
 if __name__ == '__main__':
