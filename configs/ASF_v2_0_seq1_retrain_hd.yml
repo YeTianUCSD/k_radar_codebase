@@ -351,6 +351,12 @@ MODEL:
         RANDOMNESS: 0.0
       DETACH_CLS_IN_TRAIN: false
       TRAIN_QUANTIZE: ste
+      ADAPTER:
+        ENABLED: true
+        HIDDEN_CHANNELS: 256
+        ACTIVATION: GELU
+        SCALE: 0.05
+        REG_WEIGHT: 0.1
       COMMENT: 'Offline retrain only: use STE quantized HD encoding during train
         so optimization matches quantized inference.'
 OPTIMIZER:

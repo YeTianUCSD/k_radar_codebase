@@ -1,7 +1,36 @@
 import torch
+import torch.nn as nn
 
 from .anchor_head_integrated import AnchorHeadSingleIntegrated
 from models.hd import HDCore
+
+
+class ResidualHDAdapter(nn.Module):
+    def __init__(self, channels, cfg=None):
+        super().__init__()
+        cfg = {} if cfg is None else cfg
+        hidden = int(cfg.get('HIDDEN_CHANNELS', max(64, channels // 4)))
+        activation = str(cfg.get('ACTIVATION', 'GELU')).lower()
+        if activation == 'relu':
+            act = nn.ReLU(inplace=True)
+        elif activation == 'silu':
+            act = nn.SiLU(inplace=True)
+        else:
+            act = nn.GELU()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=1, bias=True),
+            act,
+            nn.Conv2d(hidden, channels, kernel_size=1, bias=True),
+        )
+        self.scale = float(cfg.get('SCALE', 0.05))
+        self.last_delta = None
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x):
+        delta = self.scale * self.net(x)
+        self.last_delta = delta
+        return x + delta
 
 
 class AnchorHeadSingleHD(AnchorHeadSingleIntegrated):
@@ -19,6 +48,11 @@ class AnchorHeadSingleHD(AnchorHeadSingleIntegrated):
         hd_cfg = self.model_cfg.get('HD', None)
         if hd_cfg is None:
             raise RuntimeError('AnchorHeadSingleHD requires MODEL.HEAD.HD config.')
+        adapter_cfg = hd_cfg.get('ADAPTER', {})
+        if bool(adapter_cfg.get('ENABLED', False)):
+            self.hd_adapter = ResidualHDAdapter(input_channels, adapter_cfg)
+        else:
+            self.hd_adapter = nn.Identity()
         self.hd_core = HDCore.from_head_cfg(
             hd_cfg=hd_cfg,
             feat_dim=input_channels,
@@ -31,7 +65,8 @@ class AnchorHeadSingleHD(AnchorHeadSingleIntegrated):
         if spatial_features_2d is None:
             spatial_features_2d = data_dict[self.key_features]
 
-        cls_preds = self.hd_core.logits_from_feature_map(spatial_features_2d)
+        hd_features = self.hd_adapter(spatial_features_2d)
+        cls_preds = self.hd_core.logits_from_feature_map(hd_features)
         detach_cls_in_train = bool(self.model_cfg.HD.get('DETACH_CLS_IN_TRAIN', True))
         if self.training and detach_cls_in_train:
             cls_preds = cls_preds.detach()
@@ -40,7 +75,7 @@ class AnchorHeadSingleHD(AnchorHeadSingleIntegrated):
 
         self.forward_ret_dict['cls_preds'] = cls_preds
         self.forward_ret_dict['box_preds'] = box_preds
-        self.forward_ret_dict['hd_features'] = spatial_features_2d
+        self.forward_ret_dict['hd_features'] = hd_features
 
         if self.conv_dir_cls is not None:
             dir_cls_preds = self.conv_dir_cls(spatial_features_2d)
@@ -65,6 +100,21 @@ class AnchorHeadSingleHD(AnchorHeadSingleIntegrated):
             data_dict = self.post_processing(data_dict)
 
         return data_dict
+
+    def loss(self, dict_item, key_for_logging=None):
+        loss = super().loss(dict_item, key_for_logging=key_for_logging)
+        adapter_cfg = self.model_cfg.HD.get('ADAPTER', {})
+        reg_weight = float(adapter_cfg.get('REG_WEIGHT', 0.0))
+        delta = getattr(getattr(self, 'hd_adapter', None), 'last_delta', None)
+        if reg_weight > 0.0 and delta is not None:
+            adapter_reg = delta.float().pow(2).mean() * reg_weight
+            loss = loss + adapter_reg
+            key = 'hd_adapter_reg' if key_for_logging is None else f'hd_adapter_reg_{key_for_logging}'
+            if self.is_logging:
+                if 'logging' not in dict_item.keys():
+                    dict_item['logging'] = dict()
+                dict_item['logging'][key] = float(adapter_reg.detach().cpu().item())
+        return loss
 
     @torch.no_grad()
     def get_hd_features_by_labels(

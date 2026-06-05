@@ -11,8 +11,6 @@
 # Library
 import os
 import numpy as np
-import cv2
-import open3d as o3d
 
 # User Library
 import configs.config_general as cnf
@@ -270,6 +268,7 @@ def get_pixel_index_from_m_coordinate(v0, v1, type='yz'):
         return None, None
 
 def get_front_beside_image_from_point_cloud(pc_os64, radius=1, color=(0,0,0)):
+    import cv2
     # pc -> front img
     pc_xyz = pc_os64['values'].copy()
     list_x = pc_xyz[:,0]
@@ -295,6 +294,7 @@ def get_front_beside_image_from_point_cloud(pc_os64, radius=1, color=(0,0,0)):
     return img_bev_f, img_bev_b
 
 def get_o3d_point_cloud(arr_pc, color=None):
+    import open3d as o3d
     pcd = o3d.geometry.PointCloud()
 
     pcd.points = o3d.utility.Vector3dVector(arr_pc[:,:3])
@@ -316,6 +316,7 @@ def filter_pc_with_roi_in_xyz(arr_pc, list_roi_xyz):
     return pc_filtered
 
 def get_o3d_line_set_from_tuple_bbox(tuple_bbox, is_with_arrow=True, length_arrow=1.0, length_tips=0.4, cfg=None):
+    import open3d as o3d
     name_cls, idx_cls, list_values, _ = tuple_bbox
     x, y, z, theta, l, w, h = list_values
 
@@ -401,6 +402,8 @@ def get_points_power_from_cube_bev(cube_bev, bin_size, power_multiplier=10.0, po
     return np.array(list_points)
     
 def get_list_bboxes_tuples_from_inference(arr_rpn, bin_size, arr_reg, thr_rpn=0.5, is_vis=False, cfg=None, cls=None):
+    if is_vis:
+        import cv2
     bin_z, bin_y, bin_x = bin_size # [m/bin]
     len_y, len_x = arr_rpn.shape
     
@@ -448,6 +451,7 @@ def get_list_bboxes_tuples_from_inference(arr_rpn, bin_size, arr_reg, thr_rpn=0.
     return list_tuples
 
 def get_o3d_line_set_from_list_infos(list_infos, color = [0., 0., 0.], is_with_arrow=True, length_arrow=1.0, length_tips=0.4):
+    import open3d as o3d
     x, y, z, azi_deg, l_2, w_2, h_2 = list_infos
     theta = azi_deg*np.pi/180.
     l = l_2*2.

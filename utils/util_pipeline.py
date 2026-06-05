@@ -11,8 +11,6 @@
 import torch
 import numpy as np
 import random
-import matplotlib.pyplot as plt
-import cv2
 import time
 
 from models.skeletons import build_skeleton
@@ -107,6 +105,7 @@ def set_random_seed(seed, is_cuda_seed=False, is_deterministic=True):
     ### changed ###
 
 def vis_tesseract_pline(p_pline, idx=0, vis_type='ra', is_in_deg=True, is_vis_local_maxima_along_range=False):
+    import matplotlib.pyplot as plt
     '''
     * args
     *   idx: index of data
@@ -178,6 +177,8 @@ def vis_tesseract_pline(p_pline, idx=0, vis_type='ra', is_in_deg=True, is_vis_lo
         return
 
 def vis_tesseract_ra_bbox_pline(p_pline, idx, roi_x, roi_y, is_with_label=True, is_in_deg=True):
+    import cv2
+    import matplotlib.pyplot as plt
     datum = p_pline.dataset[idx]
     
     # mean doppler
@@ -255,6 +256,7 @@ def vis_tesseract_ra_bbox_pline(p_pline, idx, roi_x, roi_y, is_with_label=True, 
 
     
 def draw_labels_in_yx_bgr(arr_yx_in, arr_y_in, arr_x_in, label_in, is_with_bbox_mask=True):
+    import cv2
     arr_yx = arr_yx_in.copy()
     arr_y = arr_y_in.copy()
     arr_x = arr_x_in.copy()

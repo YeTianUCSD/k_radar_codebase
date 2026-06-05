@@ -2,12 +2,10 @@
 """
 Offline HD retraining for ASF/K-Radar on the source sequence.
 
-This script supports three practical modes:
-  1) memory-only retrain: freeze CNN/ASF weights and only update HD memory;
-  2) detection-head retrain: optimize non-HD detector-head weights and update
-     HD memory;
-  3) fuser+head retrain: optimize the fusion module plus non-HD detector-head
-     weights and update HD memory.
+This script retrains ASF weights against an HD-only classification head.
+At every epoch it rebuilds HD memory from the current source-train features,
+trains the selected CNN/ASF parameters with that memory fixed, then rebuilds
+memory again before evaluation/checkpointing.
 
 The original CNN training and online HD adaptation scripts are untouched.
 """
@@ -59,28 +57,14 @@ def parse_args():
     parser.add_argument('--max_steps_per_epoch', type=int, default=-1)
     parser.add_argument('--shuffle', action='store_true')
 
-    parser.add_argument('--trainable', choices=['none', 'memory_only', 'detection_head', 'head', 'fuser_head', 'full'], default='none',
-                        help='none/memory_only updates only HD memory; detection_head/head optimize detector head weights; fuser_head optimizes fusion and detector head; full optimizes all non-HD parameters.')
+    parser.add_argument('--trainable', choices=['none', 'memory_only', 'hd_adapter', 'detection_head', 'head', 'fuser_head', 'full'], default='none',
+                        help='none/memory_only updates only HD memory; hd_adapter optimizes only the HD adapter; detection_head/head optimize detector head weights; fuser_head optimizes fusion and detector head; full optimizes all non-HD parameters.')
     parser.add_argument('--optimizer', choices=['adam', 'adamw', 'sgd'], default='adamw')
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--weight_decay', type=float, default=0.0)
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--grad_clip', type=float, default=1.0)
 
-    parser.add_argument('--memory_update', choices=['perceptron', 'build', 'adaptive', 'none'], default='perceptron',
-                        help='Retrain update after epoch 1. perceptron is HyperLidar-style +true/-wrong.')
-    parser.add_argument('--memory_alpha', type=float, default=1.0,
-                        help='Prototype update scale for retrain epochs.')
-    parser.add_argument('--memory_build_alpha', type=float, default=1.0,
-                        help='Prototype update scale for epoch-1 full build.')
-    parser.add_argument('--buffer_percent', type=float, default=0.05,
-                        help='Total retrain buffer ratio after epoch 1. Default 0.05.')
-    parser.add_argument('--wrong_buffer_percent', type=float, default=0.025,
-                        help='Ratio sampled from currently wrong candidates. Default 0.025.')
-    parser.add_argument('--random_buffer_percent', type=float, default=0.025,
-                        help='Ratio sampled randomly from remaining candidates. Default 0.025.')
-    parser.add_argument('--buffer_mode', choices=['sampled', 'all'], default='sampled',
-                        help='sampled: wrong+random buffer; all: update all selected candidates for comparison.')
     parser.add_argument('--include_negative', action='store_true', default=True,
                         help='Include background anchors with max_neg_* caps. Enabled by default.')
     parser.add_argument('--no_include_negative', dest='include_negative', action='store_false')
@@ -94,11 +78,11 @@ def parse_args():
     parser.add_argument('--save_every_epochs', type=int, default=1)
     parser.add_argument('--conf_thr', type=float, default=0.3)
     parser.add_argument('--hd_train_quantize', choices=['config', 'false', 'true', 'ste'], default='config',
-                        help='Config override only. No backprop is used in this pipeline.')
+                        help='Config override for HD encoding during backprop.')
     parser.add_argument('--hd_logit_scale', type=float, default=None,
                         help='Optional HD logit scale override.')
     parser.add_argument('--hd_cls_weight', type=float, default=None,
-                        help='Compatibility only. No detector loss is optimized here.')
+                        help='Optional override for HD classification loss weight.')
     parser.add_argument('--enable_scl_loss', action='store_true')
     parser.add_argument('--skip_baseline_eval', action='store_true')
     parser.add_argument('--skip_final_eval', action='store_true')
@@ -123,6 +107,21 @@ def set_trainable_scope(network, scope):
         return freeze_network(network)
 
     enabled_modules = {}
+
+    if scope == 'hd_adapter':
+        head = getattr(network, 'head', None)
+        adapter = getattr(head, 'hd_adapter', None) if head is not None else None
+        if adapter is None:
+            raise RuntimeError('hd_adapter scope requires network.head.hd_adapter')
+        enabled_adapter = 0
+        for param in adapter.parameters():
+            if param.is_floating_point() or param.is_complex():
+                param.requires_grad = True
+                enabled_adapter += param.numel()
+        enabled_modules['hd_adapter'] = int(enabled_adapter)
+        if enabled_adapter <= 0:
+            raise RuntimeError('No trainable parameters found for scope=hd_adapter. Enable MODEL.HEAD.HD.ADAPTER.')
+        return {'trainable_params': int(enabled_adapter), 'enabled_modules': enabled_modules}
 
     if scope == 'fuser_head':
         fuser = getattr(network, 'fuser', None)
@@ -267,101 +266,48 @@ def select_candidates(head, feat_map, labels, args):
     )
 
 
-@torch.no_grad()
-def predict_memory_indices(hd_core, feat_anchor):
-    if feat_anchor.numel() == 0:
-        return feat_anchor.new_empty((0,), dtype=torch.long)
-    hv = hd_core.embedder.forward_chunked(feat_anchor, chunk=int(hd_core.cfg.encode_chunk))
-    hv = torch.nn.functional.normalize(hv.float(), p=2, dim=1)
-    logits = hd_core.memory.logits(hv, temperature=float(hd_core.cfg.temperature))
-    return logits.argmax(dim=1).long()
-
-
 def labels_to_memory_indices(hd_core, labels_1based):
     return hd_core._labels_to_memory_indices(labels_1based)
 
 
 @torch.no_grad()
-def sample_retrain_buffer(hd_core, feat_sel, labels_sel, args):
-    n = int(labels_sel.numel())
-    if n == 0:
-        empty = torch.empty((0,), device=labels_sel.device, dtype=torch.long)
-        return empty, empty, {'num_total': 0, 'num_bg': 0, 'num_pos': 0, 'num_correct': 0, 'num_wrong': 0, 'num_random': 0}
+def rebuild_hd_memory_inplace(pline, loader, args, desc='* Rebuild HD memory'):
+    head = require_hd_head(pline.network)
+    head.hd_core.memory.reset()
+    stats_sum = {'num_total': 0, 'num_bg': 0, 'num_pos': 0, 'num_correct': 0, 'num_wrong': 0, 'num_random': 0}
 
-    mem_labels = labels_to_memory_indices(hd_core, labels_sel)
-    pred = predict_memory_indices(hd_core, feat_sel)
-    wrong_mask = pred != mem_labels
-    wrong_idx = torch.nonzero(wrong_mask, as_tuple=False).view(-1)
+    for batch_idx, batch in enumerate(tqdm(loader, desc=desc)):
+        if args.max_steps_per_epoch > 0 and batch_idx >= args.max_steps_per_epoch:
+            clear_batch(batch)
+            break
+        feat_sel, labels_sel = extract_hd_features_by_labels(
+            pline.network,
+            batch,
+            max_pos_per_class=args.max_pos_per_class,
+            max_total_pos=args.max_total_pos,
+            include_negative=bool(args.include_negative and head.hd_core.cfg.use_background),
+            max_neg_per_batch=args.max_neg_per_batch,
+            max_neg_ratio=args.max_neg_ratio,
+        )
+        if labels_sel.numel() > 0:
+            head.hd_core.build_update(feat_sel, labels_sel, alpha=1.0)
+            mem_labels = labels_to_memory_indices(head.hd_core, labels_sel)
+            stats_sum['num_total'] += int(labels_sel.numel())
+            if bool(head.hd_core.cfg.use_background):
+                stats_sum['num_bg'] += int((mem_labels == 0).sum().item())
+                stats_sum['num_pos'] += int((mem_labels > 0).sum().item())
+            else:
+                stats_sum['num_pos'] += int(labels_sel.numel())
+        clear_batch(batch)
 
-    if args.buffer_mode == 'all':
-        selected = torch.arange(n, device=labels_sel.device, dtype=torch.long)
-        num_random = int((~wrong_mask).sum().item())
-    else:
-        total_k = int(round(float(args.buffer_percent) * n))
-        wrong_k = int(round(float(args.wrong_buffer_percent) * n))
-        random_k = int(round(float(args.random_buffer_percent) * n))
-        if total_k > 0 and (wrong_k + random_k) <= 0:
-            random_k = total_k
-        if total_k > 0 and (wrong_k + random_k) > total_k:
-            random_k = max(0, total_k - wrong_k)
-
-        if wrong_k > 0 and wrong_idx.numel() > wrong_k:
-            wrong_idx = wrong_idx[torch.randperm(wrong_idx.numel(), device=wrong_idx.device)[:wrong_k]]
-
-        chosen_mask = torch.zeros(n, device=labels_sel.device, dtype=torch.bool)
-        if wrong_idx.numel() > 0:
-            chosen_mask[wrong_idx] = True
-
-        remaining_idx = torch.nonzero(~chosen_mask, as_tuple=False).view(-1)
-        if random_k > 0 and remaining_idx.numel() > random_k:
-            remaining_idx = remaining_idx[torch.randperm(remaining_idx.numel(), device=remaining_idx.device)[:random_k]]
-        elif random_k <= 0:
-            remaining_idx = remaining_idx[:0]
-
-        parts = []
-        if wrong_idx.numel() > 0:
-            parts.append(wrong_idx)
-        if remaining_idx.numel() > 0:
-            parts.append(remaining_idx)
-        if parts:
-            selected = torch.cat(parts, dim=0)
-        else:
-            selected = torch.empty((0,), device=labels_sel.device, dtype=torch.long)
-        num_random = int(remaining_idx.numel())
-
-    stats = {
-        'num_total': int(selected.numel()),
-        'num_bg': int((mem_labels[selected] == 0).sum().item()) if bool(hd_core.cfg.use_background) and selected.numel() > 0 else 0,
-        'num_pos': int((mem_labels[selected] > 0).sum().item()) if bool(hd_core.cfg.use_background) and selected.numel() > 0 else int(selected.numel()),
-        'num_correct': int((~wrong_mask).sum().item()),
-        'num_wrong': int(wrong_mask.sum().item()),
-        'num_random': num_random,
-    }
-    return selected, pred, stats
-
-
-@torch.no_grad()
-def apply_perceptron_update(hd_core, feat_anchor, labels_1based, pred_indices, alpha):
-    if feat_anchor.numel() == 0:
-        return 0
-    labels = labels_to_memory_indices(hd_core, labels_1based)
-    hv = hd_core.embedder.forward_chunked(feat_anchor, chunk=int(hd_core.cfg.encode_chunk))
-    hv = torch.nn.functional.normalize(hv.float(), p=2, dim=1)
-    hd_core.memory.add_(labels, hv, alpha=float(alpha))
-    wrong = pred_indices != labels
-    if wrong.any():
-        hd_core.memory.add_(pred_indices[wrong], -hv[wrong], alpha=float(alpha))
-    hd_core.memory.normalize_()
-    return int(labels.numel())
+    head.hd_core.memory.normalize_()
+    return stats_sum
 
 
 def run_hd_memory_epoch(pline, loader, args, epoch, optimizer=None, trainable_parameters=None):
     is_trainable = optimizer is not None
-    head = set_hd_update_mode(pline.network, train_network=is_trainable)
-    if epoch == 1:
-        head.hd_core.memory.reset()
+    set_hd_update_mode(pline.network, train_network=is_trainable)
 
-    stats_sum = {'num_total': 0, 'num_bg': 0, 'num_pos': 0, 'num_correct': 0, 'num_wrong': 0, 'num_random': 0}
     loss_sum = 0.0
     grad_norm_sum = 0.0
     pbar = tqdm(loader, desc=f'* Offline HD retrain epoch {epoch}/{args.epochs}')
@@ -400,71 +346,14 @@ def run_hd_memory_epoch(pline, loader, args, epoch, optimizer=None, trainable_pa
                 optimizer.step()
             grad_norm_sum += grad_value
 
-        with torch.no_grad():
-            set_hd_update_mode(pline.network, train_network=False)
-            _ = pline.network(batch)
-            feat_map = head.forward_ret_dict.get('hd_features', None)
-            labels = head.forward_ret_dict.get('box_cls_labels', None)
-            if feat_map is None or labels is None:
-                raise RuntimeError('HD memory retrain requires hd_features and box_cls_labels in forward_ret_dict.')
-
-            feat_sel, labels_sel = select_candidates(head, feat_map, labels, args)
-            if labels_sel.numel() == 0:
-                if is_trainable:
-                    set_hd_update_mode(pline.network, train_network=True)
-                clear_batch(batch)
-                continue
-
-            if epoch == 1:
-                num = head.hd_core.build_update(feat_sel, labels_sel, alpha=float(args.memory_build_alpha))
-                mem_labels = labels_to_memory_indices(head.hd_core, labels_sel)
-                stats = {
-                    'num_total': int(num),
-                    'num_bg': int((mem_labels == 0).sum().item()) if bool(head.hd_core.cfg.use_background) else 0,
-                    'num_pos': int((mem_labels > 0).sum().item()) if bool(head.hd_core.cfg.use_background) else int(num),
-                    'num_correct': 0,
-                    'num_wrong': 0,
-                    'num_random': 0,
-                }
-            elif args.memory_update == 'none':
-                stats = {'num_total': 0, 'num_bg': 0, 'num_pos': 0, 'num_correct': 0, 'num_wrong': 0, 'num_random': 0}
-            elif args.memory_update == 'build':
-                selected, pred, stats = sample_retrain_buffer(head.hd_core, feat_sel, labels_sel, args)
-                if selected.numel() > 0:
-                    head.hd_core.build_update(feat_sel[selected], labels_sel[selected], alpha=float(args.memory_alpha))
-            elif args.memory_update == 'adaptive':
-                selected, pred, stats = sample_retrain_buffer(head.hd_core, feat_sel, labels_sel, args)
-                if selected.numel() > 0:
-                    head.hd_core.adaptive_update(feat_sel[selected], labels_sel[selected], alpha=float(args.memory_alpha))
-            else:
-                selected, pred, stats = sample_retrain_buffer(head.hd_core, feat_sel, labels_sel, args)
-                if selected.numel() > 0:
-                    apply_perceptron_update(
-                        head.hd_core,
-                        feat_sel[selected],
-                        labels_sel[selected],
-                        pred[selected],
-                        alpha=float(args.memory_alpha),
-                    )
-
-        for key in stats_sum:
-            stats_sum[key] += int(stats.get(key, 0))
         pbar.set_postfix(
             loss=f'{loss_sum / max(1, steps):.4f}' if is_trainable else '0.0000',
-            total=stats.get('num_total', 0),
-            pos=stats.get('num_pos', 0),
-            bg=stats.get('num_bg', 0),
-            wrong=stats.get('num_wrong', 0),
-            rand=stats.get('num_random', 0),
         )
-        if is_trainable:
-            set_hd_update_mode(pline.network, train_network=True)
         clear_batch(batch)
 
-    head.hd_core.memory.normalize_()
     avg_loss = loss_sum / max(1, steps) if is_trainable else 0.0
     avg_grad_norm = grad_norm_sum / max(1, steps) if is_trainable else 0.0
-    return steps, stats_sum, avg_loss, avg_grad_norm
+    return steps, avg_loss, avg_grad_norm
 
 
 @torch.no_grad()
@@ -586,7 +475,7 @@ def main():
 
     with open(os.path.join(pline.path_log, 'run_meta.yml'), 'w') as f:
         yaml.safe_dump({
-            'pipeline': 'hyperlidar_style_hd_offline_retrain',
+            'pipeline': 'hd_offline_retrain_epoch_rebuild',
             'config': args.config,
             'runtime_config': runtime_config,
             'init_model': args.init_model,
@@ -599,13 +488,6 @@ def main():
             'weight_decay': args.weight_decay,
             'momentum': args.momentum,
             'grad_clip': args.grad_clip,
-            'memory_update': args.memory_update,
-            'memory_alpha': args.memory_alpha,
-            'memory_build_alpha': args.memory_build_alpha,
-            'buffer_mode': args.buffer_mode,
-            'buffer_percent': args.buffer_percent,
-            'wrong_buffer_percent': args.wrong_buffer_percent,
-            'random_buffer_percent': args.random_buffer_percent,
             'include_negative': bool(args.include_negative),
             'epochs': args.epochs,
             'max_steps_per_epoch': args.max_steps_per_epoch,
@@ -644,7 +526,7 @@ def main():
     update_idx = 0
 
     baseline_path = os.path.join(model_dir, 'baseline.checkpoint')
-    baseline_meta = {'pipeline': 'hyperlidar_memory', 'trainable': args.trainable}
+    baseline_meta = {'pipeline': 'hd_epoch_rebuild', 'trainable': args.trainable}
     save_checkpoint(baseline_path, pline.network, 0, update_idx, best_score, 'baseline', baseline_meta)
     if not args.skip_baseline_eval:
         eval_t0 = time.time()
@@ -675,19 +557,27 @@ def main():
         best_source_path = baseline_path
 
     for epoch in range(1, int(args.epochs) + 1):
+        rebuild_hd_memory_inplace(
+            pline, loader, args, desc=f'* Rebuild HD memory before epoch {epoch}/{args.epochs}'
+        )
+
         train_t0 = time.time()
-        steps, stats_sum, avg_loss, avg_grad_norm = run_hd_memory_epoch(
+        steps, avg_loss, avg_grad_norm = run_hd_memory_epoch(
             pline, loader, args, epoch, optimizer=optimizer, trainable_parameters=trainable_parameters
         )
         train_time = time.time() - train_t0
         update_idx += steps
+
+        stats_sum = rebuild_hd_memory_inplace(
+            pline, loader, args, desc=f'* Rebuild HD memory after epoch {epoch}/{args.epochs}'
+        )
 
         checkpoint_path = ''
         save_time = 0.0
         if args.save_every_epochs > 0 and (epoch % args.save_every_epochs) == 0:
             checkpoint_path = os.path.join(model_dir, f'model_{epoch}.pt')
             save_t0 = time.time()
-            save_checkpoint(checkpoint_path, pline.network, epoch, update_idx, best_score, f'epoch_{epoch}', {'pipeline': 'hyperlidar_memory', 'trainable': args.trainable})
+            save_checkpoint(checkpoint_path, pline.network, epoch, update_idx, best_score, f'epoch_{epoch}', {'pipeline': 'hd_epoch_rebuild', 'trainable': args.trainable})
             save_time = time.time() - save_t0
 
         score = None
@@ -696,7 +586,7 @@ def main():
             if not checkpoint_path:
                 checkpoint_path = os.path.join(model_dir, f'model_{epoch}.pt')
                 save_t0 = time.time()
-                save_checkpoint(checkpoint_path, pline.network, epoch, update_idx, best_score, f'epoch_{epoch}', {'pipeline': 'hyperlidar_memory', 'trainable': args.trainable})
+                save_checkpoint(checkpoint_path, pline.network, epoch, update_idx, best_score, f'epoch_{epoch}', {'pipeline': 'hd_epoch_rebuild', 'trainable': args.trainable})
                 save_time += time.time() - save_t0
             eval_t0 = time.time()
             score, _rows = run_eval(pline, epoch=epoch, conf_thr=args.conf_thr)
@@ -735,7 +625,7 @@ def main():
 
     if not args.skip_final_eval and int(args.epochs) > 0 and (args.eval_every_epochs <= 0 or (int(args.epochs) % args.eval_every_epochs) != 0):
         final_path = os.path.join(model_dir, f'model_{int(args.epochs)}.pt')
-        save_checkpoint(final_path, pline.network, int(args.epochs), update_idx, best_score, f'epoch_{int(args.epochs)}', {'pipeline': 'hyperlidar_memory', 'trainable': args.trainable})
+        save_checkpoint(final_path, pline.network, int(args.epochs), update_idx, best_score, f'epoch_{int(args.epochs)}', {'pipeline': 'hd_epoch_rebuild', 'trainable': args.trainable})
         eval_t0 = time.time()
         score, _rows = run_eval(pline, epoch=int(args.epochs), conf_thr=args.conf_thr)
         eval_time = time.time() - eval_t0
@@ -759,7 +649,7 @@ def main():
         })
 
     last_path = os.path.join(model_dir, 'last.checkpoint')
-    save_checkpoint(last_path, pline.network, int(args.epochs), update_idx, best_score, 'last', {'pipeline': 'hyperlidar_memory', 'trainable': args.trainable})
+    save_checkpoint(last_path, pline.network, int(args.epochs), update_idx, best_score, 'last', {'pipeline': 'hd_epoch_rebuild', 'trainable': args.trainable})
     append_row(metrics_csv, {
         'event': 'last_saved',
         'timestamp': timestamp_now(),
