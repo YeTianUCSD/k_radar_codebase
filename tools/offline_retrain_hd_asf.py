@@ -64,6 +64,20 @@ def parse_args():
     parser.add_argument('--weight_decay', type=float, default=0.0)
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--grad_clip', type=float, default=1.0)
+    parser.add_argument('--memory_update', choices=['none', 'perceptron'], default='none',
+                        help='HD memory update rule used inside each training epoch.')
+    parser.add_argument('--memory_alpha', type=float, default=1.0,
+                        help='Step size for sampled HD memory updates during retraining.')
+    parser.add_argument('--memory_build_alpha', type=float, default=1.0,
+                        help='Step size used when fully rebuilding HD memory from current features.')
+    parser.add_argument('--buffer_mode', choices=['none', 'sampled'], default='none',
+                        help='How to choose HD-memory update samples after epoch 1.')
+    parser.add_argument('--buffer_percent', type=float, default=0.0,
+                        help='Fraction of HD candidates retained for buffered retraining.')
+    parser.add_argument('--wrong_buffer_percent', type=float, default=0.0,
+                        help='Fraction of HD candidates selected from historical hard wrong samples.')
+    parser.add_argument('--random_buffer_percent', type=float, default=0.0,
+                        help='Fraction of HD candidates randomly selected for buffered retraining.')
 
     parser.add_argument('--include_negative', action='store_true', default=True,
                         help='Include background anchors with max_neg_* caps. Enabled by default.')
@@ -271,6 +285,143 @@ def labels_to_memory_indices(hd_core, labels_1based):
 
 
 @torch.no_grad()
+def collect_hd_candidates_from_forward(head, args):
+    feat_map = head.forward_ret_dict.get('hd_features', None)
+    labels_map = head.forward_ret_dict.get('box_cls_labels', None)
+    if feat_map is None or labels_map is None:
+        raise RuntimeError('HD retrain expects head.forward_ret_dict to contain hd_features and box_cls_labels.')
+
+    feat_anchor = head.hd_core.make_anchor_features(feat_map.detach())
+    labels = labels_map.reshape(-1).long().detach()
+
+    selected_parts = []
+    max_pos_per_class = int(args.max_pos_per_class)
+    for cls_id in range(1, head.num_class + 1):
+        cls_idx = torch.nonzero(labels == cls_id, as_tuple=False).view(-1)
+        if cls_idx.numel() == 0:
+            continue
+        if max_pos_per_class > 0:
+            cls_idx = cls_idx[:max_pos_per_class]
+        selected_parts.append(cls_idx)
+
+    include_negative = bool(args.include_negative and head.hd_core.cfg.use_background)
+    num_pos = sum(int(x.numel()) for x in selected_parts)
+    if include_negative:
+        neg_idx = torch.nonzero(labels == 0, as_tuple=False).view(-1)
+        max_neg = int(args.max_neg_per_batch)
+        max_neg_ratio = float(args.max_neg_ratio)
+        if max_neg_ratio > 0.0 and num_pos > 0:
+            ratio_cap = int(round(max_neg_ratio * num_pos))
+            max_neg = ratio_cap if max_neg <= 0 else min(max_neg, ratio_cap)
+        if max_neg > 0:
+            neg_idx = neg_idx[:max_neg]
+        if neg_idx.numel() > 0:
+            selected_parts.append(neg_idx)
+
+    if not selected_parts:
+        empty_feat = feat_anchor.new_empty((0, feat_anchor.shape[1]))
+        empty_labels = labels.new_empty((0,), dtype=torch.long)
+        empty_indices = labels.new_empty((0,), dtype=torch.long)
+        return empty_feat, empty_labels, empty_indices
+
+    selected = torch.cat(selected_parts, dim=0)
+    max_total_pos = int(args.max_total_pos)
+    if max_total_pos > 0 and num_pos > max_total_pos:
+        pos_mask = labels[selected] > 0
+        pos_selected = selected[pos_mask][:max_total_pos]
+        other_selected = selected[~pos_mask]
+        selected = torch.cat([pos_selected, other_selected], dim=0)
+
+    return feat_anchor[selected], labels[selected], selected
+
+
+@torch.no_grad()
+def compute_hd_buffer_predictions(head, feat_sel, labels_sel):
+    labels_mem = labels_to_memory_indices(head.hd_core, labels_sel)
+    hv_sel = head.hd_core.embedder.forward_chunked(feat_sel, chunk=int(head.hd_core.cfg.encode_chunk))
+    hv_sel = torch.nn.functional.normalize(hv_sel.float(), p=2, dim=1)
+    logits_sel = head.hd_core.memory.logits(hv_sel, temperature=float(head.hd_core.cfg.temperature))
+    pred_sel = logits_sel.argmax(dim=1).long()
+
+    losses = logits_sel.new_zeros((labels_mem.numel(),), dtype=logits_sel.dtype)
+    wrong_mask = pred_sel != labels_mem
+    if wrong_mask.any():
+        row_idx = torch.arange(labels_mem.shape[0], device=labels_mem.device)
+        true_scores = logits_sel[row_idx, labels_mem]
+        wrong_scores = logits_sel[row_idx, pred_sel]
+        losses[wrong_mask] = (wrong_scores - true_scores)[wrong_mask]
+
+    return {
+        'labels_mem': labels_mem,
+        'hv_sel': hv_sel,
+        'pred_sel': pred_sel,
+        'wrong_mask': wrong_mask,
+        'losses': losses,
+    }
+
+
+@torch.no_grad()
+def select_buffer_indices(num_items, wrong_state, args):
+    if num_items <= 0:
+        empty = torch.zeros((0,), device=wrong_state.device, dtype=torch.long)
+        return empty, 0
+
+    total_target = int(num_items * float(args.buffer_percent))
+    if total_target <= 0:
+        empty = torch.zeros((0,), device=wrong_state.device, dtype=torch.long)
+        return empty, 0
+
+    wrong_target = int(num_items * float(args.wrong_buffer_percent))
+    random_target = int(num_items * float(args.random_buffer_percent))
+    if wrong_target + random_target < total_target:
+        random_target += total_target - (wrong_target + random_target)
+    elif wrong_target + random_target > total_target:
+        overflow = wrong_target + random_target - total_target
+        random_target = max(0, random_target - overflow)
+
+    wrong_target = min(wrong_target, num_items)
+    sorted_indices = torch.argsort(wrong_state, descending=True)
+    wrong_indices = sorted_indices[:wrong_target]
+
+    selected_mask = torch.zeros((num_items,), device=wrong_state.device, dtype=torch.bool)
+    if wrong_indices.numel() > 0:
+        selected_mask[wrong_indices] = True
+
+    remaining_indices = torch.nonzero(~selected_mask, as_tuple=False).view(-1)
+    random_target = min(random_target, int(remaining_indices.numel()))
+    if random_target > 0:
+        rand_perm = torch.randperm(remaining_indices.numel(), device=wrong_state.device)[:random_target]
+        random_indices = remaining_indices[rand_perm]
+    else:
+        random_indices = torch.zeros((0,), device=wrong_state.device, dtype=torch.long)
+
+    selected = torch.cat([wrong_indices, random_indices], dim=0)
+    if selected.numel() < total_target:
+        if selected.numel() > 0:
+            selected_mask[selected] = True
+        remaining_indices = torch.nonzero(~selected_mask, as_tuple=False).view(-1)
+        extra_needed = min(total_target - selected.numel(), int(remaining_indices.numel()))
+        if extra_needed > 0:
+            extra_perm = torch.randperm(remaining_indices.numel(), device=wrong_state.device)[:extra_needed]
+            extra_indices = remaining_indices[extra_perm]
+            selected = torch.cat([selected, extra_indices], dim=0)
+            random_indices = torch.cat([random_indices, extra_indices], dim=0)
+
+    return selected, int(random_indices.numel())
+
+
+@torch.no_grad()
+def update_wrong_buffer_state(previous_state, selected_indices, wrong_mask_selected, losses_selected):
+    next_state = previous_state.clone()
+    if selected_indices.numel() > 0:
+        next_state[selected_indices] = 0.0
+        if wrong_mask_selected.any():
+            wrong_selected_indices = selected_indices[wrong_mask_selected]
+            next_state[wrong_selected_indices] = losses_selected[wrong_mask_selected].to(next_state.dtype)
+    return next_state
+
+
+@torch.no_grad()
 def rebuild_hd_memory_inplace(pline, loader, args, desc='* Rebuild HD memory'):
     head = require_hd_head(pline.network)
     head.hd_core.memory.reset()
@@ -290,7 +441,7 @@ def rebuild_hd_memory_inplace(pline, loader, args, desc='* Rebuild HD memory'):
             max_neg_ratio=args.max_neg_ratio,
         )
         if labels_sel.numel() > 0:
-            head.hd_core.build_update(feat_sel, labels_sel, alpha=1.0)
+            head.hd_core.build_update(feat_sel, labels_sel, alpha=float(args.memory_build_alpha))
             mem_labels = labels_to_memory_indices(head.hd_core, labels_sel)
             stats_sum['num_total'] += int(labels_sel.numel())
             if bool(head.hd_core.cfg.use_background):
@@ -304,12 +455,16 @@ def rebuild_hd_memory_inplace(pline, loader, args, desc='* Rebuild HD memory'):
     return stats_sum
 
 
-def run_hd_memory_epoch(pline, loader, args, epoch, optimizer=None, trainable_parameters=None):
+def run_hd_memory_epoch(pline, loader, args, epoch, optimizer=None, trainable_parameters=None, wrong_buffer_state=None):
     is_trainable = optimizer is not None
     set_hd_update_mode(pline.network, train_network=is_trainable)
+    head = require_hd_head(pline.network)
+    if wrong_buffer_state is None:
+        wrong_buffer_state = {}
 
     loss_sum = 0.0
     grad_norm_sum = 0.0
+    stats_sum = {'num_total': 0, 'num_bg': 0, 'num_pos': 0, 'num_correct': 0, 'num_wrong': 0, 'num_random': 0}
     pbar = tqdm(loader, desc=f'* Offline HD retrain epoch {epoch}/{args.epochs}')
     steps = 0
     for step_idx, batch in enumerate(pbar, start=1):
@@ -345,15 +500,78 @@ def run_hd_memory_epoch(pline, loader, args, epoch, optimizer=None, trainable_pa
                     torch.nn.utils.clip_grad_norm_(trainable_parameters, max_norm=float(args.grad_clip))
                 optimizer.step()
             grad_norm_sum += grad_value
+        else:
+            _dict_net = pline.network(batch)
+
+        feat_sel, labels_sel, _candidate_indices = collect_hd_candidates_from_forward(head, args)
+        if labels_sel.numel() > 0:
+            pred_info = compute_hd_buffer_predictions(head, feat_sel, labels_sel)
+            current_state = wrong_buffer_state.get(step_idx, None)
+            if current_state is None or current_state.shape[0] != labels_sel.shape[0]:
+                current_state = pred_info['losses'].new_zeros((labels_sel.shape[0],), dtype=torch.float32)
+            else:
+                current_state = current_state.to(pred_info['losses'].device, dtype=torch.float32)
+
+            if epoch <= 1 or args.buffer_mode == 'none' or args.memory_update == 'none':
+                next_state = pred_info['losses'].new_zeros((labels_sel.shape[0],), dtype=torch.float32)
+                if pred_info['wrong_mask'].any():
+                    next_state[pred_info['wrong_mask']] = pred_info['losses'][pred_info['wrong_mask']].to(next_state.dtype)
+                wrong_buffer_state[step_idx] = next_state.detach().cpu()
+
+                stats_sum['num_total'] += int(labels_sel.numel())
+                mem_labels = pred_info['labels_mem']
+                if bool(head.hd_core.cfg.use_background):
+                    stats_sum['num_bg'] += int((mem_labels == 0).sum().item())
+                    stats_sum['num_pos'] += int((mem_labels > 0).sum().item())
+                else:
+                    stats_sum['num_pos'] += int(mem_labels.numel())
+            else:
+                stats_sum['num_correct'] += int((~pred_info['wrong_mask']).sum().item())
+                stats_sum['num_wrong'] += int(pred_info['wrong_mask'].sum().item())
+
+                selected_indices, num_random = select_buffer_indices(labels_sel.shape[0], current_state, args)
+                wrong_selected = pred_info['wrong_mask'][selected_indices] if selected_indices.numel() > 0 else pred_info['wrong_mask'].new_zeros((0,), dtype=torch.bool)
+                losses_selected = pred_info['losses'][selected_indices] if selected_indices.numel() > 0 else pred_info['losses'].new_zeros((0,))
+                next_state = update_wrong_buffer_state(current_state, selected_indices, wrong_selected, losses_selected)
+                wrong_buffer_state[step_idx] = next_state.detach().cpu()
+
+                if selected_indices.numel() > 0:
+                    labels_mem_selected = pred_info['labels_mem'][selected_indices]
+                    hv_selected = pred_info['hv_sel'][selected_indices]
+                    pred_selected = pred_info['pred_sel'][selected_indices]
+
+                    if wrong_selected.any() and args.memory_update == 'perceptron':
+                        hv_wrong = hv_selected[wrong_selected]
+                        labels_true_wrong = labels_mem_selected[wrong_selected]
+                        labels_pred_wrong = pred_selected[wrong_selected]
+                        alpha = float(args.memory_alpha)
+                        head.hd_core.memory.add_(labels_true_wrong, hv_wrong, alpha=alpha)
+                        head.hd_core.memory.add_(labels_true_wrong, hv_wrong, alpha=alpha)
+                        head.hd_core.memory.add_(labels_pred_wrong, -hv_wrong, alpha=alpha)
+                        head.hd_core.memory.add_(labels_pred_wrong, -hv_wrong, alpha=alpha)
+                        head.hd_core.memory.normalize_()
+
+                    stats_sum['num_total'] += int(selected_indices.numel())
+                    stats_sum['num_random'] += int(num_random)
+                    if bool(head.hd_core.cfg.use_background):
+                        stats_sum['num_bg'] += int((labels_mem_selected == 0).sum().item())
+                        stats_sum['num_pos'] += int((labels_mem_selected > 0).sum().item())
+                    else:
+                        stats_sum['num_pos'] += int(labels_mem_selected.numel())
 
         pbar.set_postfix(
             loss=f'{loss_sum / max(1, steps):.4f}' if is_trainable else '0.0000',
+            total=stats_sum['num_total'],
+            bg=stats_sum['num_bg'],
+            pos=stats_sum['num_pos'],
+            wrong=stats_sum['num_wrong'],
+            rand=stats_sum['num_random'],
         )
         clear_batch(batch)
 
     avg_loss = loss_sum / max(1, steps) if is_trainable else 0.0
     avg_grad_norm = grad_norm_sum / max(1, steps) if is_trainable else 0.0
-    return steps, avg_loss, avg_grad_norm
+    return steps, avg_loss, avg_grad_norm, stats_sum, wrong_buffer_state
 
 
 @torch.no_grad()
@@ -389,7 +607,7 @@ def rebuild_hd_memory(pline, args, checkpoint_path, runtime_config):
             max_neg_ratio=args.max_neg_ratio,
         )
         if labels_sel.numel() > 0:
-            head.hd_core.build_update(feat_sel, labels_sel)
+            head.hd_core.build_update(feat_sel, labels_sel, alpha=float(args.memory_build_alpha))
             pos_mask = labels_sel > 0
             if pos_mask.any():
                 shifted = labels_sel[pos_mask].detach().cpu().long() - 1
@@ -436,6 +654,7 @@ def rebuild_hd_memory(pline, args, checkpoint_path, runtime_config):
 
 def main():
     args = parse_args()
+    print('* Parsed args for offline HD retrain', flush=True)
     best_metric = {
         'CLS': args.best_metric_cls,
         'KIND': args.best_metric_kind,
@@ -444,6 +663,7 @@ def main():
         'REDUCE': 'mean',
         'ONLY_CLASSES_WITH_GT': True,
     }
+    print('* Building runtime config', flush=True)
     runtime_config, _runtime_cfg = make_runtime_config(
         args.config,
         args.output_root,
@@ -456,13 +676,20 @@ def main():
         best_metric=best_metric,
     )
     _runtime_cfg = apply_runtime_overrides(runtime_config, args)
+    print(f'* Runtime config ready: {runtime_config}', flush=True)
 
     from pipelines.pipeline_detection_v1_0 import PipelineDetection_v1_0
 
+    print('* Creating PipelineDetection_v1_0', flush=True)
     pline = PipelineDetection_v1_0(path_cfg=runtime_config, mode='train')
+    print('* PipelineDetection_v1_0 created', flush=True)
+    print(f'* Loading init model: {args.init_model}', flush=True)
     missing, unexpected = load_model_checkpoint(pline.network, args.init_model)
+    print('* Init model loaded', flush=True)
     head = require_hd_head(pline.network)
+    print(f'* Loading HD memory: {args.hd_memory}', flush=True)
     hd_meta = head.hd_core.load_memory(args.hd_memory, map_location='cpu')
+    print('* HD memory loaded', flush=True)
 
     if (not args.enable_scl_loss) and hasattr(pline.network, 'is_scl'):
         pline.network.is_scl = False
@@ -473,9 +700,10 @@ def main():
     optimizer = build_optimizer(pline.network, args)
     trainable_parameters = [p for p in pline.network.parameters() if p.requires_grad]
 
+    print('* Writing run metadata', flush=True)
     with open(os.path.join(pline.path_log, 'run_meta.yml'), 'w') as f:
         yaml.safe_dump({
-            'pipeline': 'hd_offline_retrain_epoch_rebuild',
+            'pipeline': 'hd_offline_retrain_epoch_rebuild' if args.buffer_mode == 'none' else 'hyperlidar_style_hd_offline_retrain_epoch_rebuild',
             'config': args.config,
             'runtime_config': runtime_config,
             'init_model': args.init_model,
@@ -488,6 +716,13 @@ def main():
             'weight_decay': args.weight_decay,
             'momentum': args.momentum,
             'grad_clip': args.grad_clip,
+            'memory_update': args.memory_update,
+            'memory_alpha': args.memory_alpha,
+            'memory_build_alpha': args.memory_build_alpha,
+            'buffer_mode': args.buffer_mode,
+            'buffer_percent': args.buffer_percent,
+            'wrong_buffer_percent': args.wrong_buffer_percent,
+            'random_buffer_percent': args.random_buffer_percent,
             'include_negative': bool(args.include_negative),
             'epochs': args.epochs,
             'max_steps_per_epoch': args.max_steps_per_epoch,
@@ -524,6 +759,7 @@ def main():
     best_score = None
     t_start = time.time()
     update_idx = 0
+    wrong_buffer_state = {}
 
     baseline_path = os.path.join(model_dir, 'baseline.checkpoint')
     baseline_meta = {'pipeline': 'hd_epoch_rebuild', 'trainable': args.trainable}
@@ -556,14 +792,15 @@ def main():
         copy_checkpoint(baseline_path, best_path)
         best_source_path = baseline_path
 
+    print('* Entering training loop', flush=True)
     for epoch in range(1, int(args.epochs) + 1):
         rebuild_hd_memory_inplace(
             pline, loader, args, desc=f'* Rebuild HD memory before epoch {epoch}/{args.epochs}'
         )
 
         train_t0 = time.time()
-        steps, avg_loss, avg_grad_norm = run_hd_memory_epoch(
-            pline, loader, args, epoch, optimizer=optimizer, trainable_parameters=trainable_parameters
+        steps, avg_loss, avg_grad_norm, train_stats, wrong_buffer_state = run_hd_memory_epoch(
+            pline, loader, args, epoch, optimizer=optimizer, trainable_parameters=trainable_parameters, wrong_buffer_state=wrong_buffer_state
         )
         train_time = time.time() - train_t0
         update_idx += steps
@@ -605,12 +842,12 @@ def main():
             'update_idx': update_idx,
             'loss': avg_loss,
             'grad_norm': avg_grad_norm,
-            'num_total': stats_sum['num_total'],
-            'num_bg': stats_sum['num_bg'],
-            'num_pos': stats_sum['num_pos'],
-            'num_correct': stats_sum['num_correct'],
-            'num_wrong': stats_sum['num_wrong'],
-            'num_random': stats_sum['num_random'],
+            'num_total': train_stats['num_total'],
+            'num_bg': train_stats['num_bg'],
+            'num_pos': train_stats['num_pos'],
+            'num_correct': train_stats['num_correct'],
+            'num_wrong': train_stats['num_wrong'],
+            'num_random': train_stats['num_random'],
             'score': '' if score is None else score,
             'best_score': '' if best_score is None else best_score,
             'checkpoint': checkpoint_path,
@@ -621,7 +858,11 @@ def main():
             'save_time_sec': save_time,
             'elapsed_sec': time.time() - t_start,
         })
-        print(f'* Epoch {epoch}: trainable={args.trainable} score={score}, best={best_score}, loss={avg_loss:.6f}, stats={stats_sum}', flush=True)
+        print(
+            f'* Epoch {epoch}: trainable={args.trainable} score={score}, best={best_score}, ' 
+            f'loss={avg_loss:.6f}, train_stats={train_stats}, rebuild_stats={stats_sum}',
+            flush=True,
+        )
 
     if not args.skip_final_eval and int(args.epochs) > 0 and (args.eval_every_epochs <= 0 or (int(args.epochs) % args.eval_every_epochs) != 0):
         final_path = os.path.join(model_dir, f'model_{int(args.epochs)}.pt')
