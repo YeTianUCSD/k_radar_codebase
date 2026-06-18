@@ -42,7 +42,7 @@ def checkpoint_epoch(path):
     match = re.search(r'model_(\d+)\.pt$', name)
     if match:
         return int(match.group(1))
-    return name
+    return None
 
 
 def collect_checkpoints(args):
@@ -100,8 +100,8 @@ def summarize_metrics(
     timing=None,
 ):
     score = pline.pick_best_metric_score(eval_rows)
-    selected = []
     metric_cfg = pline.best_metric_cfg
+    selected = pline.select_best_metric_rows(eval_rows)
     metric_values = {}
     for row in eval_rows:
         cls_name = str(row['cls']).lower()
@@ -111,16 +111,6 @@ def summarize_metrics(
         metric_values[f'{prefix}_bev'] = row['bev']
         metric_values[f'{prefix}_3d'] = row['3d']
 
-        if abs(float(row['conf_thr']) - metric_cfg['conf_thr']) > 1e-6:
-            continue
-        if metric_cfg['cls'] != 'auto' and str(row['cls']).lower() != metric_cfg['cls']:
-            continue
-        if not any(abs(float(row['iou']) - iou) <= 1e-6 for iou in metric_cfg['ious']):
-            continue
-        if metric_cfg['only_classes_with_gt'] and not row.get('has_gt', True):
-            continue
-        selected.append(row)
-
     summary = {
         'eval_name': eval_name,
         'config': config_path,
@@ -128,9 +118,13 @@ def summarize_metrics(
         'checkpoint_name': os.path.basename(checkpoint_path),
         'checkpoint_epoch': checkpoint_epoch(checkpoint_path),
         'score': '' if score is None else score,
+        'score_kind': metric_cfg['kind'],
         'selected_metric_count': len(selected),
         'selected_metrics': ';'.join(
             f"{row['cls']}/{row['iou']}/{row['3d']:.6f}" for row in selected
+        ),
+        'selected_score_values': ';'.join(
+            f"{float(row[metric_cfg['kind']]):.6f}" for row in selected
         ),
         'log_dir': pline.path_log,
     }
@@ -149,8 +143,10 @@ def write_csv(path_csv, rows):
         'checkpoint_name',
         'checkpoint_epoch',
         'score',
+        'score_kind',
         'selected_metric_count',
         'selected_metrics',
+        'selected_score_values',
         'timestamp',
         'setup_time_sec',
         'load_model_time_sec',
@@ -299,22 +295,27 @@ def main():
                 f'setup={setup_time_sec:.2f}s, load={load_model_time_sec:.2f}s, '
                 f'eval={eval_time_sec:.2f}s, total={total_time_sec:.2f}s'
             )
-            summary_rows.append(
-                summarize_metrics(
-                    pline,
-                    eval_rows,
-                    eval_name,
-                    config_path,
-                    checkpoint_path,
-                    timing={
-                        'timestamp': timestamp_now(),
-                        'setup_time_sec': setup_time_sec,
-                        'load_model_time_sec': load_model_time_sec,
-                        'eval_time_sec': eval_time_sec,
-                        'total_time_sec': total_time_sec,
-                    },
-                )
+            summary = summarize_metrics(
+                pline,
+                eval_rows,
+                eval_name,
+                config_path,
+                checkpoint_path,
+                timing={
+                    'timestamp': timestamp_now(),
+                    'setup_time_sec': setup_time_sec,
+                    'load_model_time_sec': load_model_time_sec,
+                    'eval_time_sec': eval_time_sec,
+                    'total_time_sec': total_time_sec,
+                },
             )
+            summary_rows.append(summary)
+            print(
+                f"* Score {eval_name}/{ckpt_name}: {summary['score']} "
+                f"(selected {summary['selected_metric_count']} metrics)"
+            )
+            print(f"* Selected metrics {eval_name}/{ckpt_name}: {summary['selected_metrics']}")
+            print(f"* Selected score values {eval_name}/{ckpt_name}: {summary['selected_score_values']}")
             write_csv(args.summary_csv, summary_rows)
 
             for writer_name in ('log_train_iter', 'log_train_epoch', 'log_test'):

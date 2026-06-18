@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Offline HD retraining for ASF/K-Radar on the source sequence.
+Offline HyperLidar-style HD retraining for ASF/K-Radar on the source sequence.
 
-This script retrains ASF weights against an HD-only classification head.
-At every epoch it rebuilds HD memory from the current source-train features,
-trains the selected CNN/ASF parameters with that memory fixed, then rebuilds
-memory again before evaluation/checkpointing.
+This script keeps the loaded source HD memory as the starting point, uses the
+first epoch to initialize hard-sample state from full candidates, and then
+applies sampled perceptron-style HD memory updates in later epochs.
 
 The original CNN training and online HD adaptation scripts are untouched.
 """
@@ -32,7 +31,6 @@ from tools.hd_utils_asf import (
     clear_batch,
     close_writers,
     copy_checkpoint,
-    extract_hd_features_by_labels,
     load_model_checkpoint,
     make_runtime_config,
     require_hd_head,
@@ -53,7 +51,7 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--epochs', type=int, default=5,
-                        help='Total HD epochs. Epoch 1 is full memory build; later epochs are buffer retrain.')
+                        help='Total HD epochs. Epoch 1 initializes hard-sample state; later epochs use sampled buffer retrain.')
     parser.add_argument('--max_steps_per_epoch', type=int, default=-1)
     parser.add_argument('--shuffle', action='store_true')
 
@@ -68,8 +66,7 @@ def parse_args():
                         help='HD memory update rule used inside each training epoch.')
     parser.add_argument('--memory_alpha', type=float, default=1.0,
                         help='Step size for sampled HD memory updates during retraining.')
-    parser.add_argument('--memory_build_alpha', type=float, default=1.0,
-                        help='Step size used when fully rebuilding HD memory from current features.')
+
     parser.add_argument('--buffer_mode', choices=['none', 'sampled'], default='none',
                         help='How to choose HD-memory update samples after epoch 1.')
     parser.add_argument('--buffer_percent', type=float, default=0.0,
@@ -421,40 +418,6 @@ def update_wrong_buffer_state(previous_state, selected_indices, wrong_mask_selec
     return next_state
 
 
-@torch.no_grad()
-def rebuild_hd_memory_inplace(pline, loader, args, desc='* Rebuild HD memory'):
-    head = require_hd_head(pline.network)
-    head.hd_core.memory.reset()
-    stats_sum = {'num_total': 0, 'num_bg': 0, 'num_pos': 0, 'num_correct': 0, 'num_wrong': 0, 'num_random': 0}
-
-    for batch_idx, batch in enumerate(tqdm(loader, desc=desc)):
-        if args.max_steps_per_epoch > 0 and batch_idx >= args.max_steps_per_epoch:
-            clear_batch(batch)
-            break
-        feat_sel, labels_sel = extract_hd_features_by_labels(
-            pline.network,
-            batch,
-            max_pos_per_class=args.max_pos_per_class,
-            max_total_pos=args.max_total_pos,
-            include_negative=bool(args.include_negative and head.hd_core.cfg.use_background),
-            max_neg_per_batch=args.max_neg_per_batch,
-            max_neg_ratio=args.max_neg_ratio,
-        )
-        if labels_sel.numel() > 0:
-            head.hd_core.build_update(feat_sel, labels_sel, alpha=float(args.memory_build_alpha))
-            mem_labels = labels_to_memory_indices(head.hd_core, labels_sel)
-            stats_sum['num_total'] += int(labels_sel.numel())
-            if bool(head.hd_core.cfg.use_background):
-                stats_sum['num_bg'] += int((mem_labels == 0).sum().item())
-                stats_sum['num_pos'] += int((mem_labels > 0).sum().item())
-            else:
-                stats_sum['num_pos'] += int(labels_sel.numel())
-        clear_batch(batch)
-
-    head.hd_core.memory.normalize_()
-    return stats_sum
-
-
 def run_hd_memory_epoch(pline, loader, args, epoch, optimizer=None, trainable_parameters=None, wrong_buffer_state=None):
     is_trainable = optimizer is not None
     set_hd_update_mode(pline.network, train_network=is_trainable)
@@ -574,84 +537,6 @@ def run_hd_memory_epoch(pline, loader, args, epoch, optimizer=None, trainable_pa
     return steps, avg_loss, avg_grad_norm, stats_sum, wrong_buffer_state
 
 
-@torch.no_grad()
-def rebuild_hd_memory(pline, args, checkpoint_path, runtime_config):
-    missing, unexpected = load_model_checkpoint(pline.network, checkpoint_path)
-    head = require_hd_head(pline.network)
-    head.hd_core.memory.reset()
-
-    loader = torch.utils.data.DataLoader(
-        pline.dataset_train,
-        batch_size=int(args.batch_size),
-        shuffle=False,
-        collate_fn=pline.dataset_train.collate_fn,
-        num_workers=int(args.num_workers),
-        drop_last=False,
-    )
-
-    total_pos = 0
-    total_bg = 0
-    class_counts = torch.zeros(head.num_class, dtype=torch.long)
-    t0 = time.time()
-    for batch_idx, batch in enumerate(tqdm(loader, desc='* Rebuild HD memory from best checkpoint')):
-        if args.max_steps_per_epoch > 0 and batch_idx >= args.max_steps_per_epoch:
-            clear_batch(batch)
-            break
-        feat_sel, labels_sel = extract_hd_features_by_labels(
-            pline.network,
-            batch,
-            max_pos_per_class=args.max_pos_per_class,
-            max_total_pos=args.max_total_pos,
-            include_negative=bool(args.include_negative and head.hd_core.cfg.use_background),
-            max_neg_per_batch=args.max_neg_per_batch,
-            max_neg_ratio=args.max_neg_ratio,
-        )
-        if labels_sel.numel() > 0:
-            head.hd_core.build_update(feat_sel, labels_sel, alpha=float(args.memory_build_alpha))
-            pos_mask = labels_sel > 0
-            if pos_mask.any():
-                shifted = labels_sel[pos_mask].detach().cpu().long() - 1
-                class_counts.index_add_(0, shifted, torch.ones_like(shifted))
-                total_pos += int(pos_mask.sum().item())
-            total_bg += int((labels_sel == 0).sum().item())
-        clear_batch(batch)
-
-    head.hd_core.memory.normalize_()
-    build_time = time.time() - t0
-
-    hd_dir = os.path.join(pline.path_log, 'hd_memory')
-    os.makedirs(hd_dir, exist_ok=True)
-    mem_path = os.path.join(hd_dir, 'hd_memory.pth')
-    meta = {
-        'source_checkpoint': checkpoint_path,
-        'config': args.config,
-        'runtime_config': runtime_config,
-        'trainable': args.trainable,
-        'use_background': bool(head.hd_core.cfg.use_background),
-        'total_positive_anchors': int(total_pos),
-        'total_background_anchors': int(total_bg),
-        'class_counts': [int(x) for x in class_counts.tolist()],
-        'max_neg_per_batch': int(args.max_neg_per_batch),
-        'max_neg_ratio': float(args.max_neg_ratio),
-        'class_names': list(head.class_names),
-        'build_time_sec': float(build_time),
-        'timestamp': timestamp_now(),
-        'missing_keys': list(missing),
-        'unexpected_keys': list(unexpected),
-    }
-    head.hd_core.save_memory(mem_path, meta=meta)
-
-    summary_path = os.path.join(pline.path_log, 'rebuild_summary.csv')
-    with open(summary_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=list(meta.keys()) + ['memory_path'])
-        writer.writeheader()
-        row = dict(meta)
-        row['memory_path'] = mem_path
-        writer.writerow(row)
-
-    return mem_path, meta
-
-
 def main():
     args = parse_args()
     print('* Parsed args for offline HD retrain', flush=True)
@@ -703,7 +588,7 @@ def main():
     print('* Writing run metadata', flush=True)
     with open(os.path.join(pline.path_log, 'run_meta.yml'), 'w') as f:
         yaml.safe_dump({
-            'pipeline': 'hd_offline_retrain_epoch_rebuild' if args.buffer_mode == 'none' else 'hyperlidar_style_hd_offline_retrain_epoch_rebuild',
+            'pipeline': 'hd_offline_retrain' if args.buffer_mode == 'none' else 'hyperlidar_style_hd_offline_retrain',
             'config': args.config,
             'runtime_config': runtime_config,
             'init_model': args.init_model,
@@ -718,7 +603,7 @@ def main():
             'grad_clip': args.grad_clip,
             'memory_update': args.memory_update,
             'memory_alpha': args.memory_alpha,
-            'memory_build_alpha': args.memory_build_alpha,
+
             'buffer_mode': args.buffer_mode,
             'buffer_percent': args.buffer_percent,
             'wrong_buffer_percent': args.wrong_buffer_percent,
@@ -762,7 +647,7 @@ def main():
     wrong_buffer_state = {}
 
     baseline_path = os.path.join(model_dir, 'baseline.checkpoint')
-    baseline_meta = {'pipeline': 'hd_epoch_rebuild', 'trainable': args.trainable}
+    baseline_meta = {'pipeline': 'hd_offline_retrain', 'trainable': args.trainable}
     save_checkpoint(baseline_path, pline.network, 0, update_idx, best_score, 'baseline', baseline_meta)
     if not args.skip_baseline_eval:
         eval_t0 = time.time()
@@ -794,10 +679,6 @@ def main():
 
     print('* Entering training loop', flush=True)
     for epoch in range(1, int(args.epochs) + 1):
-        rebuild_hd_memory_inplace(
-            pline, loader, args, desc=f'* Rebuild HD memory before epoch {epoch}/{args.epochs}'
-        )
-
         train_t0 = time.time()
         steps, avg_loss, avg_grad_norm, train_stats, wrong_buffer_state = run_hd_memory_epoch(
             pline, loader, args, epoch, optimizer=optimizer, trainable_parameters=trainable_parameters, wrong_buffer_state=wrong_buffer_state
@@ -805,16 +686,12 @@ def main():
         train_time = time.time() - train_t0
         update_idx += steps
 
-        stats_sum = rebuild_hd_memory_inplace(
-            pline, loader, args, desc=f'* Rebuild HD memory after epoch {epoch}/{args.epochs}'
-        )
-
         checkpoint_path = ''
         save_time = 0.0
         if args.save_every_epochs > 0 and (epoch % args.save_every_epochs) == 0:
             checkpoint_path = os.path.join(model_dir, f'model_{epoch}.pt')
             save_t0 = time.time()
-            save_checkpoint(checkpoint_path, pline.network, epoch, update_idx, best_score, f'epoch_{epoch}', {'pipeline': 'hd_epoch_rebuild', 'trainable': args.trainable})
+            save_checkpoint(checkpoint_path, pline.network, epoch, update_idx, best_score, f'epoch_{epoch}', {'pipeline': 'hd_offline_retrain', 'trainable': args.trainable})
             save_time = time.time() - save_t0
 
         score = None
@@ -823,7 +700,7 @@ def main():
             if not checkpoint_path:
                 checkpoint_path = os.path.join(model_dir, f'model_{epoch}.pt')
                 save_t0 = time.time()
-                save_checkpoint(checkpoint_path, pline.network, epoch, update_idx, best_score, f'epoch_{epoch}', {'pipeline': 'hd_epoch_rebuild', 'trainable': args.trainable})
+                save_checkpoint(checkpoint_path, pline.network, epoch, update_idx, best_score, f'epoch_{epoch}', {'pipeline': 'hd_offline_retrain', 'trainable': args.trainable})
                 save_time += time.time() - save_t0
             eval_t0 = time.time()
             score, _rows = run_eval(pline, epoch=epoch, conf_thr=args.conf_thr)
@@ -860,13 +737,13 @@ def main():
         })
         print(
             f'* Epoch {epoch}: trainable={args.trainable} score={score}, best={best_score}, ' 
-            f'loss={avg_loss:.6f}, train_stats={train_stats}, rebuild_stats={stats_sum}',
+            f'loss={avg_loss:.6f}, train_stats={train_stats}',
             flush=True,
         )
 
     if not args.skip_final_eval and int(args.epochs) > 0 and (args.eval_every_epochs <= 0 or (int(args.epochs) % args.eval_every_epochs) != 0):
         final_path = os.path.join(model_dir, f'model_{int(args.epochs)}.pt')
-        save_checkpoint(final_path, pline.network, int(args.epochs), update_idx, best_score, f'epoch_{int(args.epochs)}', {'pipeline': 'hd_epoch_rebuild', 'trainable': args.trainable})
+        save_checkpoint(final_path, pline.network, int(args.epochs), update_idx, best_score, f'epoch_{int(args.epochs)}', {'pipeline': 'hd_offline_retrain', 'trainable': args.trainable})
         eval_t0 = time.time()
         score, _rows = run_eval(pline, epoch=int(args.epochs), conf_thr=args.conf_thr)
         eval_time = time.time() - eval_t0
@@ -890,7 +767,7 @@ def main():
         })
 
     last_path = os.path.join(model_dir, 'last.checkpoint')
-    save_checkpoint(last_path, pline.network, int(args.epochs), update_idx, best_score, 'last', {'pipeline': 'hd_epoch_rebuild', 'trainable': args.trainable})
+    save_checkpoint(last_path, pline.network, int(args.epochs), update_idx, best_score, 'last', {'pipeline': 'hd_offline_retrain', 'trainable': args.trainable})
     append_row(metrics_csv, {
         'event': 'last_saved',
         'timestamp': timestamp_now(),
@@ -903,25 +780,7 @@ def main():
         'elapsed_sec': time.time() - t_start,
     })
 
-    rebuild_t0 = time.time()
-    rebuilt_memory_path, rebuilt_memory_meta = rebuild_hd_memory(pline, args, best_path, runtime_config)
-    rebuild_time = time.time() - rebuild_t0
-    append_row(metrics_csv, {
-        'event': 'rebuild_best_memory',
-        'timestamp': timestamp_now(),
-        'epoch': int(args.epochs),
-        'update_idx': update_idx,
-        'best_score': '' if best_score is None else best_score,
-        'checkpoint': rebuilt_memory_path,
-        'best_checkpoint': best_path,
-        'best_source_checkpoint': best_source_path,
-        'save_time_sec': rebuild_time,
-        'elapsed_sec': time.time() - t_start,
-    })
-
     print(f'* Offline HD memory retrain finished. Best score={best_score}, best={best_path}', flush=True)
-    print(f'* Rebuilt best HD memory: {rebuilt_memory_path}', flush=True)
-    print(f'* Rebuilt memory positives={rebuilt_memory_meta["total_positive_anchors"]}, bg={rebuilt_memory_meta["total_background_anchors"]}', flush=True)
     close_writers(pline)
     os._exit(0)
 

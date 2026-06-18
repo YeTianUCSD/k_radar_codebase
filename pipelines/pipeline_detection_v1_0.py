@@ -14,21 +14,22 @@ from tqdm import tqdm
 import shutil
 from torch.utils.data import Subset
 
-# Ingnore numba warning
-from numba.core.errors import NumbaWarning
+# Ignore numba warning when numba is available.
 import warnings
 import logging
-warnings.simplefilter('ignore', category=NumbaWarning)
-numba_logger = logging.getLogger('numba')
-numba_logger.setLevel(logging.ERROR)
+try:
+    from numba.core.errors import NumbaWarning
+except ImportError:
+    NumbaWarning = None
+else:
+    warnings.simplefilter('ignore', category=NumbaWarning)
+    numba_logger = logging.getLogger('numba')
+    numba_logger.setLevel(logging.ERROR)
 
 from torch.utils.tensorboard import SummaryWriter
 
 from utils.util_pipeline import *
-from utils.util_point_cloud import *
 from utils.util_config import cfg, cfg_from_yaml_file
-
-from utils.util_point_cloud import Object3D
 import utils.kitti_eval.kitti_common as kitti
 from utils.kitti_eval.eval import get_official_eval_result
 from utils.kitti_eval.eval_revised import get_official_eval_result_revised
@@ -523,8 +524,15 @@ class PipelineDetection_v1_0():
             print(f'* Best checkpoint updated: epoch {epoch}, score={score:.6f}')
 
     def pick_best_metric_score(self, eval_metrics):
+        selected_rows = self.select_best_metric_rows(eval_metrics)
+        scores = [float(item[self.best_metric_cfg['kind']]) for item in selected_rows]
+        if len(scores) == 0:
+            return None
+        return float(np.mean(scores))
+
+    def select_best_metric_rows(self, eval_metrics):
         cfg_metric = self.best_metric_cfg
-        scores = []
+        selected = []
         for item in eval_metrics:
             if abs(float(item['conf_thr']) - cfg_metric['conf_thr']) > 1e-6:
                 continue
@@ -534,10 +542,8 @@ class PipelineDetection_v1_0():
                 continue
             if cfg_metric['only_classes_with_gt'] and not item.get('has_gt', True):
                 continue
-            scores.append(float(item[cfg_metric['kind']]))
-        if len(scores) == 0:
-            return None
-        return float(np.mean(scores))
+            selected.append(item)
+        return selected
 
     def write_best_summary(self, epoch, score, path_model=None, path_util=None):
         path_summary = os.path.join(self.path_log, 'best_summary.txt')
@@ -659,6 +665,7 @@ class PipelineDetection_v1_0():
 
     # V2
     def vis_infer(self, sample_indices, conf_thr=0.7, is_nms=True, vis_mode=['lpc', 'spcube', 'cube'], is_train=False):
+        from utils.util_point_cloud import Object3D
         '''
         * sample_indices: e.g. [0, 1, 2, 3, 4]
         * assume batch_size = 1 for convenience

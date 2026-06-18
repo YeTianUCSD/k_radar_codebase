@@ -73,6 +73,21 @@ def parse_args():
     parser.add_argument('--best_metric_kind', choices=['bev', '3d'], default='3d')
     parser.add_argument('--best_metric_ious', type=float, nargs='+', default=[0.3, 0.5])
     parser.add_argument('--best_metric_conf', type=float, default=0.3)
+
+    parser.add_argument('--superpose_enable', action='store_true',
+                        help='Enable online superposition export during adaptation.')
+    parser.add_argument('--superpose_base_scene', type=str, default='seq1',
+                        help='Name of the frozen base scene/model.')
+    parser.add_argument('--superpose_scene', type=str, default=None,
+                        help='Name of the current online adaptation scene, e.g. seq58.')
+    parser.add_argument('--superpose_modules', type=str, nargs='+', default=['fuser', 'head'],
+                        help='Top-level state_dict prefixes managed by superposition.')
+    parser.add_argument('--superpose_seed', type=int, default=20260612,
+                        help='Seed for deterministic binary sign contexts.')
+    parser.add_argument('--superpose_bundle', type=str, default=None,
+                        help='Optional existing superposition bundle used to continue accumulating scenes.')
+    parser.add_argument('--superpose_materialize_all_scenes', action='store_true',
+                        help='Materialize checkpoints for every known scene at each export.')
     return parser.parse_args()
 
 
@@ -215,7 +230,8 @@ def append_metric_row(path_csv, row):
     fieldnames = [
         'event', 'timestamp', 'step_idx', 'update_idx', 'loss', 'grad_norm',
         'score', 'best_score', 'checkpoint', 'best_checkpoint',
-        'best_source_checkpoint', 'update_time_sec', 'eval_time_sec',
+        'best_source_checkpoint', 'superpose_bundle', 'superpose_materialized_dir',
+        'superpose_base_checkpoint', 'superpose_active_checkpoint', 'update_time_sec', 'eval_time_sec',
         'save_time_sec', 'elapsed_sec',
     ]
     is_new = not os.path.exists(path_csv)
@@ -245,6 +261,15 @@ def write_run_meta(path_log, args, runtime_cfg, trainable_info, missing, unexpec
         'save_every_updates': args.save_every_updates,
         'conf_thr': args.conf_thr,
         'best_metric': runtime_cfg['GENERAL']['LOGGING']['BEST_METRIC'],
+        'superposition': {
+            'enabled': bool(args.superpose_enable),
+            'base_scene': args.superpose_base_scene,
+            'active_scene': args.superpose_scene,
+            'modules': list(args.superpose_modules),
+            'seed': int(args.superpose_seed),
+            'bundle': args.superpose_bundle,
+            'materialize_all_scenes': bool(args.superpose_materialize_all_scenes),
+        },
         'trainable_info': trainable_info,
         'missing_keys': list(missing),
         'unexpected_keys': list(unexpected),
@@ -291,6 +316,104 @@ def write_best_summary(path_log, update_idx, score, best_path, source_path, args
             best_path,
             source_path,
         ])
+
+
+def build_superposition_manager(args, path_log):
+    if not args.superpose_enable:
+        return None
+    if not args.superpose_scene:
+        raise RuntimeError('--superpose_scene is required when --superpose_enable is set')
+
+    from tools.superposition.asf_online_superposition import ASFOnlineSuperpositionManager, load_state_dict
+
+    output_dir = os.path.join(path_log, 'superposition')
+    if args.superpose_bundle:
+        manager = ASFOnlineSuperpositionManager.from_bundle(
+            args.superpose_bundle,
+            active_scene=args.superpose_scene,
+            output_dir=output_dir,
+        )
+        if list(args.superpose_modules) != list(manager.modules):
+            raise RuntimeError(
+                f'Superposition modules mismatch: cli={args.superpose_modules}, bundle={manager.modules}'
+            )
+        if str(args.superpose_base_scene) != str(manager.base_scene):
+            raise RuntimeError(
+                f'Superposition base scene mismatch: cli={args.superpose_base_scene}, bundle={manager.base_scene}'
+            )
+    else:
+        manager = ASFOnlineSuperpositionManager(
+            base_state=load_state_dict(args.init_model),
+            base_model_path=args.init_model,
+            modules=args.superpose_modules,
+            base_scene=args.superpose_base_scene,
+            active_scene=args.superpose_scene,
+            seed=args.superpose_seed,
+            output_dir=output_dir,
+        )
+    return manager
+
+
+def export_superposition_snapshot(manager, network, args, tag, step_idx, update_idx, score=None, best_score=None, source_checkpoint=None):
+    if manager is None:
+        return {}
+    manager.capture_scene_delta_from_state_dict(network.state_dict(), scene_name=args.superpose_scene)
+    if args.superpose_materialize_all_scenes:
+        scenes = [manager.base_scene] + list(manager.scene_order)
+    else:
+        scenes = [manager.base_scene, args.superpose_scene]
+    return manager.export(
+        tag=tag,
+        step_idx=step_idx,
+        update_idx=update_idx,
+        score=score,
+        best_score=best_score,
+        source_checkpoint=source_checkpoint,
+        materialize_scene_names=scenes,
+    )
+
+
+def superpose_metric_fields(args, export_info):
+    if not args.superpose_enable or not export_info:
+        return {
+            'superpose_bundle': '',
+            'superpose_materialized_dir': '',
+            'superpose_base_checkpoint': '',
+            'superpose_active_checkpoint': '',
+        }
+    return {
+        'superpose_bundle': export_info.get('bundle_path', ''),
+        'superpose_materialized_dir': export_info.get('materialized_dir', ''),
+        'superpose_base_checkpoint': export_info.get('scene_paths', {}).get(args.superpose_base_scene, ''),
+        'superpose_active_checkpoint': export_info.get('scene_paths', {}).get(args.superpose_scene, ''),
+    }
+
+
+def validate_superposition_init_state(manager, network, args):
+    if manager is None:
+        return
+    expected_state = manager.expected_init_state(args.superpose_scene)
+    current_state = network.state_dict()
+    max_abs_diff = 0.0
+    max_key = ''
+    for key in manager.selected_keys:
+        diff = (current_state[key].detach().cpu() - expected_state[key].detach().cpu()).abs()
+        if diff.numel() == 0:
+            continue
+        cur_max = float(diff.max())
+        if cur_max > max_abs_diff:
+            max_abs_diff = cur_max
+            max_key = key
+    if max_abs_diff > 1e-6:
+        if manager.has_scene(args.superpose_scene):
+            expected_desc = f"the recovered state for existing scene '{args.superpose_scene}' from --superpose_bundle"
+        else:
+            expected_desc = f"the base scene '{manager.base_scene}' state before starting new scene '{args.superpose_scene}'"
+        raise RuntimeError(
+            'Superposition init mismatch: --init_model does not match ' + expected_desc + '. '
+            + f'Max abs diff = {max_abs_diff:.6g} at key={max_key}. '
+            + 'Use the matching recovered checkpoint or the base model before continuing.'
+        )
 
 
 def clear_batch(batch):
@@ -356,6 +479,13 @@ def main():
 
     optimizer = build_optimizer(pline.network, args)
     write_run_meta(pline.path_log, args, runtime_cfg, trainable_info, missing, unexpected)
+    superpose_manager = build_superposition_manager(args, pline.path_log)
+    if superpose_manager is not None:
+        validate_superposition_init_state(superpose_manager, pline.network, args)
+        print(f'* Superposition enabled: base={superpose_manager.base_scene}, active={superpose_manager.active_scene}')
+        print(f'* Superposition modules = {superpose_manager.modules}')
+        if args.superpose_bundle:
+            print(f'* Continuing superposition bundle: {args.superpose_bundle}')
 
     stream_loader = torch.utils.data.DataLoader(
         pline.dataset_train,
@@ -380,6 +510,17 @@ def main():
     baseline_path = os.path.join(model_dir, 'baseline.checkpoint')
     save_t0 = time.time()
     save_checkpoint(baseline_path, pline.network, optimizer, 0, 0, best_score, args, 'baseline')
+    baseline_superpose = export_superposition_snapshot(
+        superpose_manager,
+        pline.network,
+        args,
+        tag='baseline',
+        step_idx=0,
+        update_idx=0,
+        score=None,
+        best_score=best_score,
+        source_checkpoint=baseline_path,
+    )
     baseline_save_time = time.time() - save_t0
 
     if not args.skip_baseline_eval:
@@ -394,6 +535,17 @@ def main():
         best_source_path = baseline_path
         if best_score is not None:
             write_best_summary(pline.path_log, 0, best_score, best_path, best_source_path, args)
+        baseline_superpose = export_superposition_snapshot(
+            superpose_manager,
+            pline.network,
+            args,
+            tag='baseline',
+            step_idx=0,
+            update_idx=0,
+            score=score,
+            best_score=best_score,
+            source_checkpoint=baseline_path,
+        )
         append_metric_row(metrics_csv, {
             'event': 'baseline_eval',
             'timestamp': timestamp_now(),
@@ -407,6 +559,7 @@ def main():
             'eval_time_sec': baseline_eval_time,
             'save_time_sec': baseline_save_time,
             'elapsed_sec': time.time() - t_start,
+            **superpose_metric_fields(args, baseline_superpose),
         })
         print(f'* Baseline eval score = {score}')
     else:
@@ -422,6 +575,7 @@ def main():
             'best_source_checkpoint': best_source_path,
             'save_time_sec': baseline_save_time,
             'elapsed_sec': time.time() - t_start,
+            **superpose_metric_fields(args, baseline_superpose),
         })
 
     step_idx = 0
@@ -475,6 +629,7 @@ def main():
 
         checkpoint_path = ''
         save_time = 0.0
+        checkpoint_superpose = {}
         if args.save_every_updates > 0 and (update_idx % args.save_every_updates) == 0:
             checkpoint_path = os.path.join(model_dir, f'update_{update_idx:04d}.checkpoint')
             save_t0 = time.time()
@@ -487,6 +642,17 @@ def main():
                 best_score,
                 args,
                 f'update_{update_idx:04d}',
+            )
+            checkpoint_superpose = export_superposition_snapshot(
+                superpose_manager,
+                pline.network,
+                args,
+                tag=f'update_{update_idx:04d}',
+                step_idx=step_idx,
+                update_idx=update_idx,
+                score=None,
+                best_score=best_score,
+                source_checkpoint=checkpoint_path,
             )
             save_time += time.time() - save_t0
 
@@ -506,6 +672,17 @@ def main():
                     args,
                     f'update_{update_idx:04d}',
                 )
+                checkpoint_superpose = export_superposition_snapshot(
+                    superpose_manager,
+                    pline.network,
+                    args,
+                    tag=f'update_{update_idx:04d}',
+                    step_idx=step_idx,
+                    update_idx=update_idx,
+                    score=None,
+                    best_score=best_score,
+                    source_checkpoint=checkpoint_path,
+                )
                 save_time += time.time() - save_t0
             eval_t0 = time.time()
             score, _rows = run_eval(pline, epoch=update_idx, args=args)
@@ -518,6 +695,17 @@ def main():
                 save_time += time.time() - save_t0
                 best_source_path = checkpoint_path
                 write_best_summary(pline.path_log, update_idx, best_score, best_path, best_source_path, args)
+                best_superpose = export_superposition_snapshot(
+                    superpose_manager,
+                    pline.network,
+                    args,
+                    tag='best',
+                    step_idx=step_idx,
+                    update_idx=update_idx,
+                    score=score,
+                    best_score=best_score,
+                    source_checkpoint=checkpoint_path,
+                )
                 append_metric_row(metrics_csv, {
                     'event': 'best_updated',
                     'timestamp': timestamp_now(),
@@ -532,6 +720,7 @@ def main():
                     'eval_time_sec': eval_time,
                     'save_time_sec': save_time,
                     'elapsed_sec': time.time() - t_start,
+                    **superpose_metric_fields(args, best_superpose),
                 })
                 print(f'* Best checkpoint updated: update={update_idx}, score={best_score:.6f}')
 
@@ -551,6 +740,7 @@ def main():
             'eval_time_sec': eval_time,
             'save_time_sec': save_time,
             'elapsed_sec': time.time() - t_start,
+            **superpose_metric_fields(args, checkpoint_superpose),
         })
         pbar.set_postfix(loss=f'{loss_value:.4f}', best='nan' if best_score is None else f'{best_score:.4f}')
         clear_batch(batch)
@@ -568,6 +758,17 @@ def main():
             args,
             f'update_{update_idx:04d}',
         )
+        final_superpose = export_superposition_snapshot(
+            superpose_manager,
+            pline.network,
+            args,
+            tag=f'update_{update_idx:04d}',
+            step_idx=step_idx,
+            update_idx=update_idx,
+            score=None,
+            best_score=best_score,
+            source_checkpoint=final_path,
+        )
         final_save_time = time.time() - save_t0
         eval_t0 = time.time()
         score, _rows = run_eval(pline, epoch=update_idx, args=args)
@@ -579,6 +780,17 @@ def main():
             final_save_time += time.time() - save_t0
             best_source_path = final_path
             write_best_summary(pline.path_log, update_idx, best_score, best_path, best_source_path, args)
+            best_superpose = export_superposition_snapshot(
+                superpose_manager,
+                pline.network,
+                args,
+                tag='best',
+                step_idx=step_idx,
+                update_idx=update_idx,
+                score=score,
+                best_score=best_score,
+                source_checkpoint=final_path,
+            )
             append_metric_row(metrics_csv, {
                 'event': 'best_updated',
                 'timestamp': timestamp_now(),
@@ -592,8 +804,20 @@ def main():
                 'eval_time_sec': final_eval_time,
                 'save_time_sec': final_save_time,
                 'elapsed_sec': time.time() - t_start,
+                **superpose_metric_fields(args, best_superpose),
             })
             print(f'* Best checkpoint updated at final eval: update={update_idx}, score={best_score:.6f}')
+        final_superpose = export_superposition_snapshot(
+            superpose_manager,
+            pline.network,
+            args,
+            tag='final',
+            step_idx=step_idx,
+            update_idx=update_idx,
+            score=score,
+            best_score=best_score,
+            source_checkpoint=final_path,
+        )
         append_metric_row(metrics_csv, {
             'event': 'final_eval',
             'timestamp': timestamp_now(),
@@ -607,11 +831,23 @@ def main():
             'eval_time_sec': final_eval_time,
             'save_time_sec': final_save_time,
             'elapsed_sec': time.time() - t_start,
+            **superpose_metric_fields(args, final_superpose),
         })
 
     last_path = os.path.join(model_dir, 'last.checkpoint')
     save_t0 = time.time()
     save_checkpoint(last_path, pline.network, optimizer, step_idx, update_idx, best_score, args, 'last')
+    last_superpose = export_superposition_snapshot(
+        superpose_manager,
+        pline.network,
+        args,
+        tag='last',
+        step_idx=step_idx,
+        update_idx=update_idx,
+        score=None,
+        best_score=best_score,
+        source_checkpoint=last_path,
+    )
     last_save_time = time.time() - save_t0
     append_metric_row(metrics_csv, {
         'event': 'last_saved',
@@ -624,6 +860,7 @@ def main():
         'best_source_checkpoint': best_source_path,
         'save_time_sec': last_save_time,
         'elapsed_sec': time.time() - t_start,
+        **superpose_metric_fields(args, last_superpose),
     })
     print(f'* Online adaptation finished. steps={step_idx}, updates={update_idx}, best_score={best_score}')
     print(f'* Output path = {pline.path_log}')
