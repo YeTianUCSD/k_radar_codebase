@@ -370,8 +370,12 @@ class AnchorHeadSingleIntegrated(nn.Module):
         # spatial_features_2d = data_dict['bev_feat']
         # spatial_features_2d = data_dict['spatial_features_2d']
 
-        cls_preds = self.conv_cls(spatial_features_2d)
-        box_preds = self.conv_box(spatial_features_2d)
+        cls_features = spatial_features_2d
+        box_features = spatial_features_2d
+        dir_features = spatial_features_2d
+
+        cls_preds = self.conv_cls(cls_features)
+        box_preds = self.conv_box(box_features)
 
         cls_preds = cls_preds.permute(0, 2, 3, 1).contiguous()  # [N, H, W, C]
         box_preds = box_preds.permute(0, 2, 3, 1).contiguous()  # [N, H, W, C]
@@ -380,7 +384,7 @@ class AnchorHeadSingleIntegrated(nn.Module):
         self.forward_ret_dict['box_preds'] = box_preds
 
         if self.conv_dir_cls is not None:
-            dir_cls_preds = self.conv_dir_cls(spatial_features_2d)
+            dir_cls_preds = self.conv_dir_cls(dir_features)
             dir_cls_preds = dir_cls_preds.permute(0, 2, 3, 1).contiguous()
             self.forward_ret_dict['dir_cls_preds'] = dir_cls_preds
         else:

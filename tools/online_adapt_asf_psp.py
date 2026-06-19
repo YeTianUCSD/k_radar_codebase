@@ -72,6 +72,11 @@ def parse_args():
     parser.add_argument('--best_metric_ious', type=float, nargs='+', default=[0.3, 0.5])
     parser.add_argument('--best_metric_conf', type=float, default=0.3)
 
+    parser.add_argument('--scene_context_train', type=str, default=None,
+                        help='Optional scene context used for online training batches. Defaults to MODEL.SUPERPOSITION.ACTIVE_SCENE from the config.')
+    parser.add_argument('--scene_context_eval', type=str, default=None,
+                        help='Optional scene context used during evaluation. Defaults to the training scene context.')
+
     return parser.parse_args()
 
 def make_runtime_config(path_config, args):
@@ -118,6 +123,24 @@ def load_model_checkpoint(network, path_ckpt):
         state_dict = payload
     missing, unexpected = network.load_state_dict(state_dict, strict=False)
     return missing, unexpected
+
+def validate_psp_checkpoint_compatibility(runtime_cfg, missing, unexpected, path_ckpt):
+    model_cfg = runtime_cfg.get('MODEL', {}) if isinstance(runtime_cfg, dict) else {}
+    superposition_cfg = model_cfg.get('SUPERPOSITION', {}) if isinstance(model_cfg, dict) else {}
+    if not bool(superposition_cfg.get('ENABLED', False)):
+        return
+    if not missing and not unexpected:
+        return
+
+    preview_missing = ', '.join(list(missing)[:8]) if missing else 'none'
+    preview_unexpected = ', '.join(list(unexpected)[:8]) if unexpected else 'none'
+    raise RuntimeError(
+        'PSP checkpoint compatibility check failed for init_model=' + str(path_ckpt) + '\n'
+        + 'The current config enables MODEL.SUPERPOSITION, so the init checkpoint must come from the PSP training pipeline, not the baseline pipeline.\n'
+        + f'Missing keys ({len(missing)}): {preview_missing}\n'
+        + f'Unexpected keys ({len(unexpected)}): {preview_unexpected}\n'
+        + 'Please use a seq1 PSP checkpoint produced by the PSP from-scratch training run.'
+    )
 
 def set_module_trainable(module, flag):
     n_params = 0
@@ -215,7 +238,7 @@ def append_metric_row(path_csv, row):
             writer.writeheader()
         writer.writerow({k: row.get(k, '') for k in fieldnames})
 
-def write_run_meta(path_log, args, runtime_cfg, trainable_info, missing, unexpected):
+def write_run_meta(path_log, args, runtime_cfg, trainable_info, missing, unexpected, train_scene_context, eval_scene_context):
     meta = {
         'config': args.config,
         'init_model': args.init_model,
@@ -234,6 +257,11 @@ def write_run_meta(path_log, args, runtime_cfg, trainable_info, missing, unexpec
         'save_every_updates': args.save_every_updates,
         'conf_thr': args.conf_thr,
         'best_metric': runtime_cfg['GENERAL']['LOGGING']['BEST_METRIC'],
+        'scene_context': {
+            'train': train_scene_context,
+            'eval': eval_scene_context,
+        },
+        'superposition': runtime_cfg.get('MODEL', {}).get('SUPERPOSITION', {}),
         'trainable_info': trainable_info,
         'missing_keys': list(missing),
         'unexpected_keys': list(unexpected),
@@ -291,6 +319,38 @@ def clear_batch(batch):
     for key in list(batch.keys()):
         batch[key] = None
 
+def resolve_default_scene_context(runtime_cfg):
+    model_cfg = runtime_cfg.get('MODEL', {}) if isinstance(runtime_cfg, dict) else {}
+    superposition_cfg = model_cfg.get('SUPERPOSITION', {}) if isinstance(model_cfg, dict) else {}
+    active_scene = superposition_cfg.get('ACTIVE_SCENE', None)
+    if active_scene is not None:
+        return str(active_scene)
+    base_scene = superposition_cfg.get('BASE_SCENE', None)
+    if base_scene is not None:
+        return str(base_scene)
+    return None
+
+def set_network_scene_context(network, scene_name):
+    if scene_name is None:
+        return None
+    network.default_scene_context = str(scene_name)
+    return network.default_scene_context
+
+def attach_batch_scene_context(batch, scene_name):
+    if scene_name is None or not isinstance(batch, dict):
+        return batch
+    batch['scene_context'] = str(scene_name)
+    return batch
+
+def run_eval(pline, epoch, args, scene_name=None):
+    previous_scene = getattr(pline.network, 'default_scene_context', None)
+    if scene_name is not None:
+        set_network_scene_context(pline.network, scene_name)
+    eval_rows = pline.validate_kitti(epoch=epoch, list_conf_thr=[float(args.conf_thr)], is_subset=False)
+    if scene_name is not None:
+        pline.network.default_scene_context = previous_scene
+    return pline.pick_best_metric_score(eval_rows), eval_rows
+
 def timestamp_now():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -304,11 +364,16 @@ def main():
     args = parse_args()
 
     path_runtime_config, runtime_cfg = make_runtime_config(args.config, args)
+    default_scene_context = resolve_default_scene_context(runtime_cfg)
+    train_scene_context = args.scene_context_train or default_scene_context
+    eval_scene_context = args.scene_context_eval or train_scene_context
     print(f'* Runtime config generated: {path_runtime_config}', flush=True)
     print(f"* Output root = {runtime_cfg['GENERAL']['LOGGING']['PATH_LOGGING']}", flush=True)
     print(f"* Run name = {runtime_cfg['GENERAL']['NAME']}", flush=True)
     print(f"* Trainable scope = {args.trainable}", flush=True)
     print(f"* Best metric = {runtime_cfg['GENERAL']['LOGGING']['BEST_METRIC']}", flush=True)
+    print(f'* Train scene context = {train_scene_context}', flush=True)
+    print(f'* Eval scene context = {eval_scene_context}', flush=True)
 
     from pipelines.pipeline_detection_v1_0 import PipelineDetection_v1_0
 
@@ -318,6 +383,7 @@ def main():
     missing, unexpected = load_model_checkpoint(pline.network, args.init_model)
     print(f'* Loaded init model: {args.init_model}')
     print(f'* Missing keys: {len(missing)} / Unexpected keys: {len(unexpected)}')
+    validate_psp_checkpoint_compatibility(runtime_cfg, missing, unexpected, args.init_model)
 
     total_params, trainable_params, enabled = set_trainable_scope(pline.network, args.trainable)
     trainable_info = {
@@ -333,8 +399,9 @@ def main():
     )
     print(f"* Enabled modules = {trainable_info['enabled_modules']}")
 
+    set_network_scene_context(pline.network, train_scene_context)
     optimizer = build_optimizer(pline.network, args)
-    write_run_meta(pline.path_log, args, runtime_cfg, trainable_info, missing, unexpected)
+    write_run_meta(pline.path_log, args, runtime_cfg, trainable_info, missing, unexpected, train_scene_context, eval_scene_context)
 
     stream_loader = torch.utils.data.DataLoader(
         pline.dataset_train,
@@ -363,8 +430,7 @@ def main():
 
     if not args.skip_baseline_eval:
         eval_t0 = time.time()
-        eval_rows = pline.validate_kitti(epoch=0, list_conf_thr=[float(args.conf_thr)], is_subset=False)
-        score = pline.pick_best_metric_score(eval_rows)
+        score, _rows = run_eval(pline, epoch=0, args=args, scene_name=eval_scene_context)
         baseline_eval_time = time.time() - eval_t0
         best_score = score
         save_t0 = time.time()
@@ -423,6 +489,7 @@ def main():
         pline.network.training = True
 
         optimizer.zero_grad(set_to_none=True)
+        attach_batch_scene_context(batch, train_scene_context)
         dict_net = pline.network(batch)
         if pline.get_loss_from == 'head':
             loss = pline.network.head.loss(dict_net)
@@ -488,8 +555,7 @@ def main():
                 )
                 save_time += time.time() - save_t0
             eval_t0 = time.time()
-            eval_rows = pline.validate_kitti(epoch=update_idx, list_conf_thr=[float(args.conf_thr)], is_subset=False)
-            score = pline.pick_best_metric_score(eval_rows)
+            score, _rows = run_eval(pline, epoch=update_idx, args=args, scene_name=eval_scene_context)
             eval_time = time.time() - eval_t0
             last_eval_update = update_idx
             if score is not None and (best_score is None or score > best_score):
@@ -551,8 +617,7 @@ def main():
         )
         final_save_time = time.time() - save_t0
         eval_t0 = time.time()
-        eval_rows = pline.validate_kitti(epoch=update_idx, list_conf_thr=[float(args.conf_thr)], is_subset=False)
-        score = pline.pick_best_metric_score(eval_rows)
+        score, _rows = run_eval(pline, epoch=update_idx, args=args, scene_name=eval_scene_context)
         final_eval_time = time.time() - eval_t0
         if score is not None and (best_score is None or score > best_score):
             best_score = score

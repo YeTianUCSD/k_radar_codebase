@@ -12,6 +12,7 @@ from .spiking_rtnh import SpikingRTNH
 from .cam_base import CamBase
 from .fusion_base import FusionBase
 from .fusion_base_integrated import FusionBaseIntegrated
+from .fusion_base_integrated_psp import FusionBaseIntegratedPSP
 
 def build_skeleton(cfg):
     return __all__[cfg.MODEL.SKELETON](cfg)
@@ -25,6 +26,7 @@ __all__ = {
     'SpikingRTNH': SpikingRTNH,
     'FusionBase': FusionBase,
     'FusionBaseIntegrated': FusionBaseIntegrated,
+    'FusionBaseIntegratedPSP': FusionBaseIntegratedPSP,
 }
 
 

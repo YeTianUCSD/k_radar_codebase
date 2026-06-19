@@ -2,10 +2,12 @@ import torch
 import torch.nn as nn
 import yaml
 import numpy as np
+from easydict import EasyDict
 
 from models import skeletons, fuser, head
 
-class FusionBaseIntegrated(nn.Module):
+
+class FusionBaseIntegratedPSP(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.init_configs(cfg)
@@ -35,6 +37,7 @@ class FusionBaseIntegrated(nn.Module):
             self.model_cfg.FUSER,
             grid_size,
             scl=self.is_scl,
+            superposition_cfg=self.superposition_cfg,
         )
         self.add_module('fuser', fusion_module)
 
@@ -53,10 +56,21 @@ class FusionBaseIntegrated(nn.Module):
             for param in self.head.parameters():
                 param.requires_grad = False
 
+    def _resolve_scene_context(self, batch_dict):
+        scene_name = batch_dict.get('scene_context', None)
+        if scene_name is not None:
+            return str(scene_name)
+        if self.scene_superposition_enabled and self.default_scene_context is None:
+            raise RuntimeError('scene_context is required when MODEL.SUPERPOSITION.ENABLED is True')
+        return self.default_scene_context
+
     def init_configs(self, cfg):
         self.cfg = cfg
         self.model_cfg = cfg.MODEL
         self.dataset_cfg = cfg.DATASET
+        self.superposition_cfg = self.model_cfg.get('SUPERPOSITION', EasyDict())
+        self.scene_superposition_enabled = bool(self.superposition_cfg.get('ENABLED', False))
+        self.default_scene_context = self.superposition_cfg.get('ACTIVE_SCENE', self.superposition_cfg.get('BASE_SCENE', None))
 
         self.num_class = 0
         self.class_names = []
@@ -76,7 +90,8 @@ class FusionBaseIntegrated(nn.Module):
     def load_each_encoder(self, encoder_cfg, type='cam'):
         with open(encoder_cfg.CFG, 'r') as f:
             new_config = yaml.safe_load(f)
-        encoder = skeletons.__all__[new_config['MODEL']['SKELETON']](new_config)
+        new_config = EasyDict(new_config)
+        encoder = skeletons.__all__[new_config.MODEL.SKELETON](new_config)
 
         if encoder_cfg.PRETRAINED is not None:
             encoder.load_state_dict(torch.load(encoder_cfg.PRETRAINED))
@@ -124,6 +139,7 @@ class FusionBaseIntegrated(nn.Module):
             self._freeze_bn()
 
     def forward(self, batch_dict):
+        batch_dict['scene_context'] = self._resolve_scene_context(batch_dict)
         batch_dict = self.cam(batch_dict)
         batch_dict = self.ldr(batch_dict)
         batch_dict = self.rdr(batch_dict)
