@@ -88,6 +88,8 @@ def parse_args():
                         help='Optional existing superposition bundle used to continue accumulating scenes.')
     parser.add_argument('--superpose_materialize_all_scenes', action='store_true',
                         help='Materialize checkpoints for every known scene at each export.')
+    parser.add_argument('--superpose_store_deltas', action='store_true',
+                        help='Also cache exact per-scene deltas inside the bundle for later exact-recovery analysis.')
     return parser.parse_args()
 
 
@@ -269,6 +271,8 @@ def write_run_meta(path_log, args, runtime_cfg, trainable_info, missing, unexpec
             'seed': int(args.superpose_seed),
             'bundle': args.superpose_bundle,
             'materialize_all_scenes': bool(args.superpose_materialize_all_scenes),
+            'store_deltas': bool(args.superpose_store_deltas),
+            'materialize_mode': 'approximate',
         },
         'trainable_info': trainable_info,
         'missing_keys': list(missing),
@@ -333,6 +337,9 @@ def build_superposition_manager(args, path_log):
             active_scene=args.superpose_scene,
             output_dir=output_dir,
         )
+        manager.store_scene_deltas = bool(manager.store_scene_deltas or args.superpose_store_deltas)
+        if manager.store_scene_deltas:
+            manager.ensure_scene(args.superpose_scene)
         if list(args.superpose_modules) != list(manager.modules):
             raise RuntimeError(
                 f'Superposition modules mismatch: cli={args.superpose_modules}, bundle={manager.modules}'
@@ -350,6 +357,7 @@ def build_superposition_manager(args, path_log):
             active_scene=args.superpose_scene,
             seed=args.superpose_seed,
             output_dir=output_dir,
+            store_scene_deltas=args.superpose_store_deltas,
         )
     return manager
 
@@ -370,6 +378,7 @@ def export_superposition_snapshot(manager, network, args, tag, step_idx, update_
         best_score=best_score,
         source_checkpoint=source_checkpoint,
         materialize_scene_names=scenes,
+        materialize_exact=False,
     )
 
 
@@ -482,8 +491,11 @@ def main():
     superpose_manager = build_superposition_manager(args, pline.path_log)
     if superpose_manager is not None:
         validate_superposition_init_state(superpose_manager, pline.network, args)
+        superpose_manager.initialize_active_scene_from_state_dict(pline.network.state_dict(), args.superpose_scene)
         print(f'* Superposition enabled: base={superpose_manager.base_scene}, active={superpose_manager.active_scene}')
         print(f'* Superposition modules = {superpose_manager.modules}')
+        print(f'* Superposition materialize mode = approximate (pure unbind)')
+        print(f'* Superposition store exact deltas = {superpose_manager.store_scene_deltas}')
         if args.superpose_bundle:
             print(f'* Continuing superposition bundle: {args.superpose_bundle}')
 
