@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import yaml
 import numpy as np
+from easydict import EasyDict
 
 from models import skeletons, fuser, head
 
@@ -76,7 +77,8 @@ class FusionBaseIntegrated(nn.Module):
     def load_each_encoder(self, encoder_cfg, type='cam'):
         with open(encoder_cfg.CFG, 'r') as f:
             new_config = yaml.safe_load(f)
-        encoder = skeletons.__all__[new_config['MODEL']['SKELETON']](new_config)
+        new_config = EasyDict(new_config)
+        encoder = skeletons.__all__[new_config.MODEL.SKELETON](new_config)
 
         if encoder_cfg.PRETRAINED is not None:
             encoder.load_state_dict(torch.load(encoder_cfg.PRETRAINED))
