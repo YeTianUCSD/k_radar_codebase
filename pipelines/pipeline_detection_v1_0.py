@@ -46,6 +46,7 @@ class PipelineDetection_v1_0():
         self.cfg = cfg_from_yaml_file(path_cfg, cfg)
         self.mode = mode
         self.update_cfg_regarding_mode()
+        print(f'* Pipeline init: mode={self.mode}, config={path_cfg}')
 
         if self.cfg.GENERAL.SEED is not None:
             try:
@@ -54,9 +55,15 @@ class PipelineDetection_v1_0():
                 print('* Exception error: check cfg.GENERAL for seed')
                 set_random_seed(cfg.GENERAL.SEED)
         
-        print('* K-Radar dataset is being loaded.')
+        print('* Pipeline init: start build_dataset(train)')
         self.dataset_train = build_dataset(self, split='train') if self.mode == 'train' else None
+        if self.dataset_train is None:
+            print('* Pipeline init: build_dataset(train) skipped for non-train mode')
+        else:
+            print(f'* Pipeline init: done build_dataset(train), len={len(self.dataset_train)}')
+        print('* Pipeline init: start build_dataset(test)')
         self.dataset_test = build_dataset(self, split='test')
+        print(f'* Pipeline init: done build_dataset(test), len={len(self.dataset_test)}')
         print('* The dataset is loaded.')
         if mode == 'train': # for setting scheduler
             self.cfg.DATASET.NUM = len(self.dataset_train)
@@ -64,14 +71,18 @@ class PipelineDetection_v1_0():
             self.cfg.DATASET.NUM = len(self.dataset_test)
         # print(self.cfg.DATASET.CLASS_INFO.NUM_CLS) # check if it is updated
 
+        print('* Pipeline init: start build_network().cuda()')
         self.network = build_network(self).cuda()
+        print('* Pipeline init: done build_network().cuda()')
         self.optimizer = build_optimizer(self, self.network)
         self.scheduler = build_scheduler(self, self.optimizer)
         self.epoch_start = 0
 
         # Logging
         if self.cfg.GENERAL.LOGGING.IS_LOGGING:
+            print('* Pipeline init: start set_logging()')
             self.set_logging(path_cfg)
+            print(f'* Pipeline init: done set_logging(), path_log={self.path_log}')
 
         # Validation
         if self.cfg.VAL.IS_VALIDATE:

@@ -181,6 +181,25 @@ def set_trainable_scope(network, scope):
         raise RuntimeError(f'No trainable parameters found for scope={scope}')
     return total, trainable, enabled
 
+def freeze_encoder_batch_stats(network):
+    frozen_modules = []
+    norm_types = (
+        torch.nn.BatchNorm1d,
+        torch.nn.BatchNorm2d,
+        torch.nn.BatchNorm3d,
+        torch.nn.LayerNorm,
+    )
+    for name in ('cam', 'ldr', 'rdr'):
+        module = getattr(network, name, None)
+        if module is None:
+            continue
+        module.eval()
+        frozen_modules.append(name)
+        for child in module.modules():
+            if isinstance(child, norm_types):
+                child.eval()
+    return frozen_modules
+
 def build_optimizer(network, args):
     params = [p for p in network.parameters() if p.requires_grad]
     if args.optimizer == 'adam':
@@ -400,6 +419,9 @@ def main():
     print(f"* Enabled modules = {trainable_info['enabled_modules']}")
 
     set_network_scene_context(pline.network, train_scene_context)
+    frozen_encoder_stats = freeze_encoder_batch_stats(pline.network)
+    if frozen_encoder_stats:
+        print(f'* Frozen encoder batch stats = {frozen_encoder_stats}')
     optimizer = build_optimizer(pline.network, args)
     write_run_meta(pline.path_log, args, runtime_cfg, trainable_info, missing, unexpected, train_scene_context, eval_scene_context)
 
@@ -487,6 +509,7 @@ def main():
         update_t0 = time.time()
         pline.network.train()
         pline.network.training = True
+        freeze_encoder_batch_stats(pline.network)
 
         optimizer.zero_grad(set_to_none=True)
         attach_batch_scene_context(batch, train_scene_context)
