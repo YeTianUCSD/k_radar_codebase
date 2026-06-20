@@ -4,7 +4,8 @@ from einops import repeat
 
 from .a2_fusion import A2Fusion
 from models.superposition import (
-    SceneContextRegistry,
+    SceneResidualBank,
+    resolve_superposition_scene_names,
     convert_module_to_psp,
     set_psp_scene_context,
     PSPMultiheadAttention,
@@ -17,8 +18,9 @@ class A2FusionPSP(A2Fusion):
         superposition_cfg = kwargs.get('superposition_cfg', None)
         seed = int(getattr(superposition_cfg, 'SEED', 20260619)) if superposition_cfg is not None else 20260619
         enabled = bool(getattr(superposition_cfg, 'ENABLED', False)) if superposition_cfg is not None else False
+        scene_names = resolve_superposition_scene_names(superposition_cfg)
 
-        self.query_scene_context_registry = SceneContextRegistry(seed=seed, enabled=enabled)
+        self.aware_query_scene_bank = SceneResidualBank(self.aware_query.shape, scene_names) if enabled and scene_names else None
 
         self.modulate_to_embed = False
         self.modulate_query = False
@@ -28,31 +30,42 @@ class A2FusionPSP(A2Fusion):
             setattr(
                 self,
                 f'to_embed_{temp_key}',
-                convert_module_to_psp(getattr(self, f'to_embed_{temp_key}'), prefix=f'fuser.to_embed.{temp_key}', seed=seed, enabled=enabled),
+                convert_module_to_psp(
+                    getattr(self, f'to_embed_{temp_key}'),
+                    prefix=f'fuser.to_embed.{temp_key}',
+                    seed=seed,
+                    enabled=enabled,
+                    scene_names=scene_names,
+                ),
             )
             setattr(
                 self,
                 f'to_patch_embed_{temp_key}',
-                convert_module_to_psp(getattr(self, f'to_patch_embed_{temp_key}'), prefix=f'fuser.to_patch_embed.{temp_key}', seed=seed, enabled=enabled),
+                convert_module_to_psp(
+                    getattr(self, f'to_patch_embed_{temp_key}'),
+                    prefix=f'fuser.to_patch_embed.{temp_key}',
+                    seed=seed,
+                    enabled=enabled,
+                    scene_names=scene_names,
+                ),
             )
 
-        self.pft = convert_module_to_psp(self.pft, prefix='fuser.pft', seed=seed, enabled=enabled)
-        self.fuser = PSPMultiheadAttention.from_multihead_attention(self.fuser, key_name='fuser.mha', seed=seed, enabled=enabled)
+        self.pft = convert_module_to_psp(self.pft, prefix='fuser.pft', seed=seed, enabled=enabled, scene_names=scene_names)
+        self.fuser = PSPMultiheadAttention.from_multihead_attention(
+            self.fuser,
+            key_name='fuser.mha',
+            seed=seed,
+            enabled=enabled,
+            scene_names=scene_names,
+        )
 
     def _get_scene_aware_query(self, scene_name):
         aware_query = self.aware_query
-        if not self.query_scene_context_registry.enabled:
+        if self.aware_query_scene_bank is None:
             return aware_query
         if scene_name is None:
-            raise RuntimeError('scene_context is required for PSP aware_query')
-        context = self.query_scene_context_registry.get_vector(
-            scene_name=str(scene_name),
-            key_name='fuser.aware_query',
-            size=aware_query.shape[-1],
-            device=aware_query.device,
-            dtype=aware_query.dtype,
-        )
-        return aware_query * context.view(1, 1, -1)
+            raise RuntimeError('scene_context is required for scene-specific aware_query')
+        return aware_query + self.aware_query_scene_bank.get(scene_name, device=aware_query.device, dtype=aware_query.dtype)
 
     def forward(self, batch_dict):
         scene_name = batch_dict.get('scene_context', None)

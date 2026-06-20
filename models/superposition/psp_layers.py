@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .scene_context import SceneContextRegistry
+from .scene_specific import SceneResidualBank, SceneWeightResidualBank
 
 
 def _validate_scene_name(scene_name):
@@ -84,15 +85,18 @@ class PSPLayerNorm(PSPContextModule):
 
 
 class PSPLinear(PSPContextModule):
-    def __init__(self, in_features, out_features, bias=True, key_name='psp.linear', seed=20260619, enabled=True):
+    def __init__(self, in_features, out_features, bias=True, key_name='psp.linear', seed=20260619, enabled=True, scene_names=None):
         super().__init__(key_name=key_name, seed=seed, enabled=enabled)
         self.in_features = int(in_features)
         self.out_features = int(out_features)
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.scene_weight_bank = SceneWeightResidualBank((out_features, in_features), scene_names or []) if enabled and scene_names else None
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features))
+            self.scene_bias_bank = SceneResidualBank((out_features,), scene_names or []) if enabled and scene_names else None
         else:
             self.register_parameter('bias', None)
+            self.scene_bias_bank = None
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -103,7 +107,7 @@ class PSPLinear(PSPContextModule):
             nn.init.uniform_(self.bias, -bound, bound)
 
     @classmethod
-    def from_linear(cls, linear, key_name, seed=20260619, enabled=True):
+    def from_linear(cls, linear, key_name, seed=20260619, enabled=True, scene_names=None):
         module = cls(
             in_features=linear.in_features,
             out_features=linear.out_features,
@@ -111,6 +115,7 @@ class PSPLinear(PSPContextModule):
             key_name=key_name,
             seed=seed,
             enabled=enabled,
+            scene_names=scene_names,
         )
         module.weight.data.copy_(linear.weight.data)
         if linear.bias is not None:
@@ -118,6 +123,8 @@ class PSPLinear(PSPContextModule):
         return module
 
     def forward(self, x):
+        weight = self.weight
+        bias = self.bias
         if self.scene_context_registry.enabled:
             scene_name = _validate_scene_name(self.active_scene_context)
             context = self.scene_context_registry.get_vector(
@@ -128,11 +135,17 @@ class PSPLinear(PSPContextModule):
                 dtype=x.dtype,
             )
             x = x * _broadcast_last_dim(context, x)
-        return F.linear(x, self.weight, self.bias)
+            if self.scene_weight_bank is not None:
+                weight = weight + self.scene_weight_bank.get(scene_name, device=self.weight.device, dtype=self.weight.dtype)
+            if self.scene_bias_bank is not None and bias is not None:
+                bias = bias + self.scene_bias_bank.get(scene_name, device=x.device, dtype=x.dtype)
+        elif bias is not None:
+            bias = bias.to(device=x.device, dtype=x.dtype)
+        return F.linear(x, weight, bias)
 
 
 class PSPConv2d(PSPContextModule):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros', key_name='psp.conv', seed=20260619, enabled=True):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros', key_name='psp.conv', seed=20260619, enabled=True, scene_names=None):
         super().__init__(key_name=key_name, seed=seed, enabled=enabled)
         if isinstance(kernel_size, int):
             kernel_size = (kernel_size, kernel_size)
@@ -145,10 +158,13 @@ class PSPConv2d(PSPContextModule):
         self.groups = int(groups)
         self.padding_mode = padding_mode
         self.weight = nn.Parameter(torch.empty(out_channels, in_channels // groups, *self.kernel_size))
+        self.scene_weight_bank = SceneWeightResidualBank((out_channels, in_channels // groups, *self.kernel_size), scene_names or []) if enabled and scene_names else None
         if bias:
             self.bias = nn.Parameter(torch.empty(out_channels))
+            self.scene_bias_bank = SceneResidualBank((out_channels,), scene_names or []) if enabled and scene_names else None
         else:
             self.register_parameter('bias', None)
+            self.scene_bias_bank = None
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -159,7 +175,7 @@ class PSPConv2d(PSPContextModule):
             nn.init.uniform_(self.bias, -bound, bound)
 
     @classmethod
-    def from_conv2d(cls, conv, key_name, seed=20260619, enabled=True):
+    def from_conv2d(cls, conv, key_name, seed=20260619, enabled=True, scene_names=None):
         module = cls(
             in_channels=conv.in_channels,
             out_channels=conv.out_channels,
@@ -173,6 +189,7 @@ class PSPConv2d(PSPContextModule):
             key_name=key_name,
             seed=seed,
             enabled=enabled,
+            scene_names=scene_names,
         )
         module.weight.data.copy_(conv.weight.data)
         if conv.bias is not None:
@@ -181,6 +198,7 @@ class PSPConv2d(PSPContextModule):
 
     def forward(self, x):
         weight = self.weight
+        bias = self.bias
         if self.scene_context_registry.enabled:
             scene_name = _validate_scene_name(self.active_scene_context)
             context = self.scene_context_registry.get_tensor(
@@ -191,11 +209,17 @@ class PSPConv2d(PSPContextModule):
                 dtype=weight.dtype,
             )
             weight = weight * context.unsqueeze(0)
-        return F.conv2d(x, weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+            if self.scene_weight_bank is not None:
+                weight = weight + self.scene_weight_bank.get(scene_name, device=self.weight.device, dtype=self.weight.dtype)
+            if self.scene_bias_bank is not None and bias is not None:
+                bias = bias + self.scene_bias_bank.get(scene_name, device=x.device, dtype=x.dtype)
+        elif bias is not None:
+            bias = bias.to(device=x.device, dtype=x.dtype)
+        return F.conv2d(x, weight, bias, self.stride, self.padding, self.dilation, self.groups)
 
 
 class PSPMultiheadAttention(PSPContextModule):
-    def __init__(self, embed_dim, num_heads, dropout=0.0, bias=True, batch_first=True, key_name='psp.mha', seed=20260619, enabled=True):
+    def __init__(self, embed_dim, num_heads, dropout=0.0, bias=True, batch_first=True, key_name='psp.mha', seed=20260619, enabled=True, scene_names=None):
         super().__init__(key_name=key_name, seed=seed, enabled=enabled)
         if embed_dim % num_heads != 0:
             raise ValueError(f'embed_dim={embed_dim} must be divisible by num_heads={num_heads}')
@@ -211,6 +235,7 @@ class PSPMultiheadAttention(PSPContextModule):
             key_name=f'{self.key_name}.q_proj',
             seed=seed,
             enabled=enabled,
+            scene_names=scene_names,
         )
         self.k_proj = PSPLinear(
             self.embed_dim,
@@ -219,6 +244,7 @@ class PSPMultiheadAttention(PSPContextModule):
             key_name=f'{self.key_name}.k_proj',
             seed=seed,
             enabled=enabled,
+            scene_names=scene_names,
         )
         self.v_proj = PSPLinear(
             self.embed_dim,
@@ -227,6 +253,7 @@ class PSPMultiheadAttention(PSPContextModule):
             key_name=f'{self.key_name}.v_proj',
             seed=seed,
             enabled=enabled,
+            scene_names=scene_names,
         )
         self.out_proj = PSPLinear(
             self.embed_dim,
@@ -235,6 +262,7 @@ class PSPMultiheadAttention(PSPContextModule):
             key_name=f'{self.key_name}.out_proj',
             seed=seed,
             enabled=enabled,
+            scene_names=scene_names,
         )
 
     def set_scene_context(self, scene_name):
@@ -245,7 +273,7 @@ class PSPMultiheadAttention(PSPContextModule):
         self.out_proj.set_scene_context(scene_name)
 
     @classmethod
-    def from_multihead_attention(cls, mha, key_name, seed=20260619, enabled=True):
+    def from_multihead_attention(cls, mha, key_name, seed=20260619, enabled=True, scene_names=None):
         module = cls(
             embed_dim=mha.embed_dim,
             num_heads=mha.num_heads,
@@ -255,6 +283,7 @@ class PSPMultiheadAttention(PSPContextModule):
             key_name=key_name,
             seed=seed,
             enabled=enabled,
+            scene_names=scene_names,
         )
         q_weight, k_weight, v_weight = mha.in_proj_weight.chunk(3, dim=0)
         module.q_proj.weight.data.copy_(q_weight.data)
@@ -375,23 +404,23 @@ class PSPMultiheadAttention(PSPContextModule):
         return attn_output, attn_weights_out
 
 
-def convert_module_to_psp(module, prefix, seed=20260619, enabled=True):
+def convert_module_to_psp(module, prefix, seed=20260619, enabled=True, scene_names=None):
     for name, child in list(module.named_children()):
         key_name = f'{prefix}.{name}' if prefix else name
         if isinstance(child, nn.Linear):
-            replacement = PSPLinear.from_linear(child, key_name=key_name, seed=seed, enabled=enabled)
+            replacement = PSPLinear.from_linear(child, key_name=key_name, seed=seed, enabled=enabled, scene_names=scene_names)
             setattr(module, name, replacement)
         elif isinstance(child, nn.Conv2d):
-            replacement = PSPConv2d.from_conv2d(child, key_name=key_name, seed=seed, enabled=enabled)
+            replacement = PSPConv2d.from_conv2d(child, key_name=key_name, seed=seed, enabled=enabled, scene_names=scene_names)
             setattr(module, name, replacement)
         elif isinstance(child, nn.LayerNorm):
             replacement = PSPLayerNorm.from_layer_norm(child, key_name=key_name, seed=seed, enabled=enabled)
             setattr(module, name, replacement)
         elif isinstance(child, nn.MultiheadAttention):
-            replacement = PSPMultiheadAttention.from_multihead_attention(child, key_name=key_name, seed=seed, enabled=enabled)
+            replacement = PSPMultiheadAttention.from_multihead_attention(child, key_name=key_name, seed=seed, enabled=enabled, scene_names=scene_names)
             setattr(module, name, replacement)
         else:
-            convert_module_to_psp(child, key_name, seed=seed, enabled=enabled)
+            convert_module_to_psp(child, key_name, seed=seed, enabled=enabled, scene_names=scene_names)
     return module
 
 

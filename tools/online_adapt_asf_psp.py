@@ -42,6 +42,8 @@ def parse_args():
 
     parser.add_argument('--trainable', choices=['cls', 'head', 'fuser_head', 'full'], default='head',
                         help='Parameter scope to update online. cls updates only head.conv_cls; head updates the full detector head.')
+    parser.add_argument('--shared_weight_policy', choices=['residual_only', 'all'], default='residual_only',
+                        help='residual_only trains only scene-specific residual banks within the selected scope; all keeps all selected shared weights trainable.')
     parser.add_argument('--batch_size', type=int, default=1,
                         help='Stream batch size.')
     parser.add_argument('--num_workers', type=int, default=0,
@@ -132,7 +134,24 @@ def validate_psp_checkpoint_compatibility(runtime_cfg, missing, unexpected, path
     if not missing and not unexpected:
         return
 
-    preview_missing = ', '.join(list(missing)[:8]) if missing else 'none'
+    allowed_missing_fragments = (
+        '.aware_query_scene_bank.params.',
+        '.scene_bias_bank.params.',
+        '.scene_weight_bank.params.',
+        'fuser.aware_query_scene_bank.params.',
+        'head.conv_cls.scene_bias_bank.params.',
+        'head.conv_box.scene_bias_bank.params.',
+        'head.conv_dir_cls.scene_bias_bank.params.',
+        'head.conv_cls.scene_weight_bank.params.',
+        'head.conv_box.scene_weight_bank.params.',
+        'head.conv_dir_cls.scene_weight_bank.params.',
+    )
+    disallowed_missing = [key for key in missing if not any(fragment in key for fragment in allowed_missing_fragments)]
+    if not disallowed_missing and not unexpected:
+        print(f'* PSP checkpoint compatibility: allowing {len(missing)} missing scene-specific residual keys from older PSP checkpoint.')
+        return
+
+    preview_missing = ', '.join(list(disallowed_missing or missing)[:8]) if missing else 'none'
     preview_unexpected = ', '.join(list(unexpected)[:8]) if unexpected else 'none'
     raise RuntimeError(
         'PSP checkpoint compatibility check failed for init_model=' + str(path_ckpt) + '\n'
@@ -232,6 +251,7 @@ def save_checkpoint(path, network, optimizer, step_idx, update_idx, best_score, 
         'update_idx': int(update_idx),
         'best_score': None if best_score is None else float(best_score),
         'trainable': args.trainable,
+        'shared_weight_policy': args.shared_weight_policy,
         'tag': tag,
     }
     torch.save(meta, str(path) + '.state')
@@ -264,6 +284,7 @@ def write_run_meta(path_log, args, runtime_cfg, trainable_info, missing, unexpec
         'run_name': args.run_name,
         'run_stamp': args.run_stamp,
         'trainable': args.trainable,
+        'shared_weight_policy': args.shared_weight_policy,
         'batch_size': args.batch_size,
         'num_workers': args.num_workers,
         'max_steps': args.max_steps,
@@ -390,11 +411,13 @@ def main():
     print(f"* Output root = {runtime_cfg['GENERAL']['LOGGING']['PATH_LOGGING']}", flush=True)
     print(f"* Run name = {runtime_cfg['GENERAL']['NAME']}", flush=True)
     print(f"* Trainable scope = {args.trainable}", flush=True)
+    print(f"* Shared weight policy = {args.shared_weight_policy}", flush=True)
     print(f"* Best metric = {runtime_cfg['GENERAL']['LOGGING']['BEST_METRIC']}", flush=True)
     print(f'* Train scene context = {train_scene_context}', flush=True)
     print(f'* Eval scene context = {eval_scene_context}', flush=True)
 
     from pipelines.pipeline_detection_v1_0 import PipelineDetection_v1_0
+    from models.superposition import freeze_shared_scene_specific_anchors, keep_only_scene_specific_residuals
 
     pline = PipelineDetection_v1_0(path_cfg=path_runtime_config, mode='train')
     shutil.copy2(os.path.realpath(__file__), os.path.join(pline.path_log, 'executed_code.txt'))
@@ -405,11 +428,31 @@ def main():
     validate_psp_checkpoint_compatibility(runtime_cfg, missing, unexpected, args.init_model)
 
     total_params, trainable_params, enabled = set_trainable_scope(pline.network, args.trainable)
+    frozen_shared_anchors = freeze_shared_scene_specific_anchors(pline.network)
+    if frozen_shared_anchors:
+        print(f'* Frozen shared superposition anchors = {frozen_shared_anchors}')
+
+    residual_kept = []
+    residual_frozen = []
+    if args.shared_weight_policy == 'residual_only':
+        residual_kept, residual_frozen = keep_only_scene_specific_residuals(pline.network, scope=args.trainable)
+        print(f'* Residual-only trainable params kept = {len(residual_kept)}')
+        if residual_kept:
+            print(f'* Residual-only kept preview = {residual_kept[:12]}')
+        if residual_frozen:
+            print(f'* Residual-only froze shared params = {len(residual_frozen)}')
+            print(f'* Residual-only frozen preview = {residual_frozen[:12]}')
+
+    trainable_params = sum(p.numel() for p in pline.network.parameters() if p.requires_grad)
+    if trainable_params <= 0:
+        raise RuntimeError(f'No trainable parameters remain after shared_weight_policy={args.shared_weight_policy} for scope={args.trainable}')
     trainable_info = {
         'total_params': int(total_params),
         'trainable_params': int(trainable_params),
         'trainable_percent': 100.0 * float(trainable_params) / max(1, float(total_params)),
         'enabled_modules': {k: int(v) for k, v in enabled.items()},
+        'residual_only_kept': list(residual_kept),
+        'residual_only_frozen_count': int(len(residual_frozen)),
     }
     print(
         '* Trainable params = '

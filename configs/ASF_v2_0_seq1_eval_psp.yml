@@ -169,6 +169,7 @@ MODEL:
 
   SUPERPOSITION:
     ENABLED: True
+    SCENE_LIST: ['seq1', 'seq58']
     BASE_SCENE: 'seq1'
     ACTIVE_SCENE: 'seq1'
     CONTEXT_TYPE: 'binary_sign'
