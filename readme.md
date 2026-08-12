@@ -1,283 +1,177 @@
-# Online Adaptation on K-radar dataset
+# Online Adaptation for Multimodal 3D Object Detection
 
-This repository is built on top of the official [K-Radar](https://github.com/kaist-avelab/K-Radar) codebase. It is mainly used for experiments on multi-modal 3D object detection with K-Radar, especially the Availability-aware Sensor Fusion (ASF) pipeline and online adaptation experiments across different K-Radar sequences.
+This repository studies online adaptation for multimodal 3D object detection in autonomous driving. 
 
-The original K-Radar project provides a large-scale 4D radar dataset and benchmark for autonomous driving, including 4D radar tensors, LiDAR, camera, RTK-GPS, and 3D bounding-box annotations. This repository keeps the core K-Radar/ASF pipeline and adds experiment scripts/configurations for:
+## Dataset
 
-- Training ASF-style sensor fusion models.
-- Evaluating trained checkpoints on selected K-Radar sequences.
-- Running online adaptation from a source sequence to a target sequence.
-- Comparing different trainable scopes during online learning.
+[K-Radar](https://github.com/kaist-avelab/K-Radar) is a large-scale autonomous-driving dataset containing synchronized 4D radar tensors, LiDAR point clouds, camera images, RTK-GPS measurements, and 3D bounding-box annotations under diverse road and weather conditions.
 
-## Acknowledgement
+Please prepare the dataset by following the instructions in the official K-Radar repository. The dataset, pretrained sensor encoders, and generated results are not included here; update the paths in `configs/` for your local setup.
 
-This repository is based on:
-
-```text
-https://github.com/kaist-avelab/K-Radar
-```
-
-Please refer to the official K-Radar repository and paper for the original dataset, benchmark, and baseline implementation.
-
-## Repository Structure
-
-```text
-configs/        Configuration files for K-Radar, ASF, sequence splits, and evaluation.
-datasets/       Dataset loading and preprocessing utilities.
-models/         Detection, fusion, and model components.
-ops/            CUDA/C++ operators and compiled extensions.
-pipelines/      Training and evaluation pipelines.
-tools/          Utility scripts, checkpoint evaluation, online adaptation, visualization helpers.
-utils/          Evaluation and geometry utilities.
-uis/            GUI-related utilities from the original K-Radar codebase.
-```
-
-Large local folders are intentionally not included in this repository:
-
-```text
-pretrained/     Pretrained model weights.
-results/        Training, evaluation, and online adaptation outputs.
-docs/           Original documentation/images.
-resources/      Original resources and large assets.
-```
 
 ## Environment
 
-The experiments were run with a conda environment named `kradar_asf`.
+This work is developed on top of the original K-Radar environment. For details about the original dataset, benchmark, and baseline implementation, please refer to the official [K-Radar repository](https://github.com/kaist-avelab/K-Radar) and paper.
 
-A minimal dependency list is provided in:
-
-```bash
-requirements.txt
-```
-
-Example setup:
+The experiments use Python 3.8 and a conda environment named `kradar_asf`:
 
 ```bash
 conda create -n kradar_asf python=3.8 -y
 conda activate kradar_asf
-
 pip install -r requirements.txt
 ```
 
-Depending on your CUDA/PyTorch version, you may need to install PyTorch, spconv, and CUDA extensions manually. The `ops/` and `utils/Rotated_IoU/` folders contain compiled/operator-related code used by the detection pipeline.
+PyTorch, CUDA, spconv, and the compiled extensions must be compatible. Depending on the local CUDA/PyTorch versions, the operators under `ops/` and `utils/Rotated_IoU/` may need to be rebuilt.
 
-## Dataset and Weights
-
-This repository does not include the K-Radar dataset, pretrained model weights, or generated experiment results.
-
-Please prepare the K-Radar dataset following the official K-Radar instructions:
+### Repository Structure
 
 ```text
-https://github.com/kaist-avelab/K-Radar
+configs/        K-Radar, ASF, sequence-split, adaptation, and evaluation configs.
+datasets/       Dataset loading, calibration, preprocessing, and batch collation.
+models/         Sensor encoders, ASF fusion modules, and 3D detection heads.
+ops/            CUDA/C++ operators and compiled extensions.
+pipelines/      Shared training and evaluation pipeline.
+tools/          Baseline, checkpoint evaluation, and online adaptation scripts.
+utils/          Optimization, geometry, post-processing, and KITTI-style evaluation.
+pretrained/     Locally prepared pretrained sensor-encoder weights.
+results/        Generated checkpoints, logs, metrics, and evaluation outputs.
 ```
 
-Expected local folders on our server:
+## Multimodal Fusion Baseline
 
-```text
-/home/code/hyperradar/dataset/k_radar
-/home/code/hyperradar/k_radar_codebase/pretrained
-/home/code/hyperradar/k_radar_codebase/results
-```
+The baseline uses pretrained Camera, LiDAR, and 4D Radar encoders to produce BEV features. ASF combines the available sensor features, and a shared anchor-based detection head predicts 3D objects. For the Sequence 1 baseline, the sensor encoders are frozen while the fusion module and detection head are trained and evaluated on Sequence 1.
 
-You may need to modify dataset paths inside the config files before running experiments.
+Training and checkpoint evaluation are packaged in `tools/run_seq1_asf_baseline.sh`.
 
-## Quick Training Example
-
-The following command runs a quick ASF training test on Sequence 1 with a small subset. This is mainly for checking whether the environment, dataset path, and training pipeline are working.
+Run training followed by evaluation of all saved checkpoints:
 
 ```bash
 cd /home/code/hyperradar/k_radar_codebase
-
-python main_train_0_args.py \
-  --config ./configs/ASF_v2_0_seq1.yml \
-  --output_dir /home/code/hyperradar/k_radar_codebase/results \
-  --exp_name seq1_asf_quick_subset \
-  --max_epoch 1 \
-  --batch_size 2 \
-  --num_workers 0 \
-  --use_val_subset \
-  --num_subset 20 \
-  --val_per_epoch_subset 1 \
-  --interval_epoch_model 1 \
-  --interval_epoch_util 1 \
-  --skip_final_eval
+FULL_EVAL_EVERY=20 bash tools/run_seq1_asf_baseline.sh all
 ```
 
-## Checkpoint Evaluation
+Using `FULL_EVAL_EVERY=20` avoids running a full validation pass after every training epoch. The `all` mode evaluates every `model_*.pt` checkpoint after training, so validating every epoch during training would duplicate most of the evaluation work.
 
-After training a model on Sequence 1, we can evaluate saved checkpoints using `tools/eval_checkpoints.py`.
-
-Example: evaluate checkpoints trained on Sequence 1 using the Sequence 1 config.
+The two stages can also run separately:
 
 ```bash
-cd /home/code/hyperradar/k_radar_codebase
+# Train ASF on Sequence 1 for 20 epochs.
+FULL_EVAL_EVERY=20 bash tools/run_seq1_asf_baseline.sh train
 
-RUN_NAME=eval_train_seq1_20ckpt_on_seq1
-RUN_DIR="/home/code/hyperradar/k_radar_codebase/results/${RUN_NAME}"
-/bin/mkdir -p "$RUN_DIR"
-LOG_FILE="${RUN_DIR}/run_$(/bin/date +%y%m%d_%H%M%S).log"
-
-/usr/bin/nohup /bin/bash -lc "
-set -euo pipefail
-
-export PATH=/home/miniconda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH
-source /home/miniconda/etc/profile.d/conda.sh
-conda activate kradar_asf
-
-export CUDA_VISIBLE_DEVICES=0
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
-
-cd /home/code/hyperradar/k_radar_codebase
-
-/home/miniconda/envs/kradar_asf/bin/python tools/eval_checkpoints.py  \
-  --checkpoint_dir /home/code/hyperradar/k_radar_codebase/results/train_seq1_20epoch_test_seq1/exp_260514_101619_train_seq1_20epoch_test_seq1/models \
-  --eval seq1=./configs/ASF_v2_0_seq1.yml \
-  --output_root ${RUN_DIR} \
-  --summary_csv ${RUN_DIR}/summary.csv \
-  --conf_thr 0.3 \
-  --best_metric_cls auto \
-  --best_metric_kind 3d \
-  --best_metric_ious 0.3 0.5 \
-  --best_metric_conf 0.3
-" > "$LOG_FILE" 2>&1 &
+# Evaluate checkpoints with the Sequence 1 config.
+bash tools/run_seq1_asf_baseline.sh eval /path/to/checkpoint/models
 ```
 
-The evaluation script writes logs and a summary CSV to:
+Settings can be overridden with environment variables:
 
-```text
-/home/code/hyperradar/k_radar_codebase/results/${RUN_NAME}
+```bash
+CUDA_VISIBLE_DEVICES=1 EPOCHS=20 FULL_EVAL_EVERY=20 \
+  bash tools/run_seq1_asf_baseline.sh all
 ```
+
+The evaluation stage writes a consolidated `summary.csv` containing Sequence 1 BEV and 3D metrics for each `model_*.pt` checkpoint. `best.checkpoint` and `latest.checkpoint` are not included unless they are passed explicitly to `tools/eval_checkpoints.py`.
 
 ## Online Adaptation
 
-This repository includes an online adaptation script:
+The supervised online adaptation pipeline starts from an ASF checkpoint trained on Sequence 1 and processes the Sequence 58 training split in temporal order with `batch_size=1` and no shuffling. Each incoming labeled batch produces one model update; the model is periodically saved and evaluated on the Sequence 58 test split.
 
-```text
-tools/online_adapt_asf.py
-```
-
-The typical setting is:
-
-1. Train or load a source model from Sequence 1.
-2. Use Sequence 58 as the target/adaptation sequence.
-3. Update selected parts of the model online.
-4. Periodically evaluate and save checkpoints.
-
-Example command:
+The command is packaged in `tools/run_seq58_online_adaptation.sh`. Pass the source checkpoint as the first argument and the trainable scope as the second:
 
 ```bash
 cd /home/code/hyperradar/k_radar_codebase
 
-RUN_NAME=online_seq58_fuser_head_from_seq1_model16_original_baseline
-OUTPUT_ROOT=/home/code/hyperradar/k_radar_codebase/results/Superposition
-LOG_FILE="${OUTPUT_ROOT}/${RUN_NAME}_$(/bin/date +%y%m%d_%H%M%S).log"
-
-/usr/bin/nohup /bin/bash -lc "
-set -euo pipefail
-
-export PATH=/home/miniconda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH
-source /home/miniconda/etc/profile.d/conda.sh
-conda activate kradar_asf
-
-export CUDA_VISIBLE_DEVICES=0
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
-
-cd /home/code/hyperradar/k_radar_codebase
-mkdir -p ${OUTPUT_ROOT}
-
-echo '[START] ${RUN_NAME} at' \$(date)
-echo '[PWD]' \$(pwd)
-echo '[CUDA_VISIBLE_DEVICES]' \$CUDA_VISIBLE_DEVICES
-echo '[CONFIG] ./configs/ASF_v2_0_seq58_adapt.yml'
-echo '[INIT_MODEL] /home/code/hyperradar/k_radar_codebase/results/offline_baseline/train_seq1_20epoch_test_seq1/exp_260514_101619_train_seq1_20epoch_test_seq1/models/model_16.pt'
-echo '[OUTPUT_ROOT] ${OUTPUT_ROOT}'
-
-/home/miniconda/envs/kradar_asf/bin/python -u tools/online_adapt_asf.py \
-  --config ./configs/ASF_v2_0_seq58_adapt.yml \
-  --init_model /home/code/hyperradar/k_radar_codebase/results/offline_baseline/train_seq1_20epoch_test_seq1/exp_260514_101619_train_seq1_20epoch_test_seq1/models/model_16.pt \
-  --output_root ${OUTPUT_ROOT} \
-  --run_name ${RUN_NAME} \
-  --trainable fuser_head \
-  --batch_size 1 \
-  --num_workers 0 \
-  --max_steps -1 \
-  --optimizer adamw \
-  --lr 0.0001 \
-  --weight_decay 0.0 \
-  --grad_clip 0 \
-  --eval_every_updates 50 \
-  --save_every_updates 50 \
-  --conf_thr 0.3 \
-  --best_metric_cls auto \
-  --best_metric_kind 3d \
-  --best_metric_ious 0.3 0.5 \
-  --best_metric_conf 0.3
-
-echo '[DONE] ${RUN_NAME} finished at' \$(date)
-" > "$LOG_FILE" 2>&1 &
-
-echo "LOG_FILE=$LOG_FILE"
+bash tools/run_seq58_online_adaptation.sh \
+  /path/to/sequence1/models/model_16.pt \
+  fuser_head
 ```
 
-## Online Adaptation Modes
+For a long-running experiment:
 
-The `--trainable` argument controls which parts of the model are updated during online adaptation:
+```bash
+mkdir -p results/run_logs
 
-```text
-head        = update detection head only
-fuser_head  = update fusion module + detection head
-full        = update encoder + fusion module + detection head
+nohup bash tools/run_seq58_online_adaptation.sh \
+  /path/to/sequence1/models/model_16.pt \
+  fuser_head \
+  > results/run_logs/online_seq58_fuser_head.log 2>&1 &
 ```
 
-This allows us to compare lightweight online adaptation against more aggressive model updates.
+The `--trainable` setting controls which parameters receive gradient updates:
 
-## Superposition Model Pipeline
+| Mode | Updated parameters |
+|---|---|
+| `cls` | Classification layer of the detection head only |
+| `head` | Complete detection head |
+| `fuser_head` | ASF fusion module and detection head |
+| `full` | Sensor encoders, fusion module, and detection head |
 
-This repository also includes a scene-conditioned superposition pipeline for carrying Sequence 1 and Sequence 58 inside one shared PSP-enabled model.
+The table describes parameters that receive gradient updates. The current adaptation config sets `FREEZE_BN: False`, and the network remains in training mode during each online update. BatchNorm running statistics in otherwise frozen modules may therefore still change for `cls`, `head`, and `fuser_head`. Set `FREEZE_BN: True` or explicitly keep the relevant BatchNorm layers in evaluation mode when an experiment requires all frozen module state to remain unchanged.
 
-The workflow is:
+The default online settings use AdamW with a learning rate of `1e-4`, save every 50 updates, and evaluate every 50 updates. These values can be overridden through environment variables defined at the top of the bash script.
 
-1. Train a PSP model from scratch on Sequence 1 using the `seq1` scene context.
-2. Load the best Sequence 1 PSP checkpoint and run supervised online adaptation on Sequence 58 using the `seq58` scene context.
-3. Evaluate the adapted shared model twice: once on Sequence 58 with the `seq58` context key, and once on Sequence 1 with the `seq1` context key.
+## Superposition-Based Knowledge-Preserving Online Update
 
-The relevant configs and scripts are:
+We design a superposition-based online update model to mitigate catastrophic forgetting during cross-sequence adaptation. Knowledge from different driving sequences is represented within one shared model through scene contexts and scene-specific residual parameters. 
+
+The pipeline has three stages:
+
+1. Train the PSP-enabled ASF model on Sequence 1 with the `seq1` context and select the best checkpoint.
+2. Adapt the checkpoint to Sequence 58 with the `seq58` context. Only the Sequence 58 residual parameters in the fusion module and detection head are updated; the shared parameters and Sequence 1 residuals remain unchanged.
+3. Use the same adapted checkpoint with the `seq58` context for Sequence 58 and the `seq1` context for Sequence 1. Switching the scene context activates the corresponding knowledge path without maintaining a separate complete model for each sequence.
+
+All stages are packaged in:
 
 ```text
-configs/ASF_v2_0_seq1_psp.yml
-configs/ASF_v2_0_seq58_adapt_psp.yml
-configs/ASF_v2_0_seq1_eval_psp.yml
-configs/ASF_v2_0_seq58_eval_psp.yml
-tools/online_adapt_asf_psp.py
-tools/eval_scene_context_asf.py
 tools/run_superposition_pipeline.sh
 ```
 
-If you want one place to review the entire runnable pipeline, use:
+Run the complete pipeline with:
 
 ```bash
 cd /home/code/hyperradar/k_radar_codebase
-bash tools/run_superposition_pipeline.sh
+bash tools/run_superposition_pipeline.sh all
 ```
 
-That script runs the following stages in order:
+For a long-running experiment:
 
-```text
-1. train_seq1_20epoch_test_seq1_psp
-2. online_seq58_fuser_head_from_seq1_psp_best
-3. eval_seq58_shared_psp_best_on_seq58
-4. eval_seq1_shared_psp_best_on_seq1
+```bash
+mkdir -p results/Superposition/v3
+
+nohup bash tools/run_superposition_pipeline.sh all \
+  > results/Superposition/v3/pipeline.log 2>&1 &
 ```
+
+The stages can also be executed separately. When an explicit checkpoint is not provided, the script automatically selects the latest matching run under `results/Superposition/v3`.
+
+```bash
+# Train the PSP-enabled ASF model on Sequence 1.
+bash tools/run_superposition_pipeline.sh train
+
+# Adapt the latest Sequence 1 best checkpoint to Sequence 58.
+bash tools/run_superposition_pipeline.sh adapt
+
+# Evaluate the adapted checkpoint on both Sequence 58 and Sequence 1.
+bash tools/run_superposition_pipeline.sh eval
+
+# Run only one of the two evaluations.
+bash tools/run_superposition_pipeline.sh eval_seq58
+bash tools/run_superposition_pipeline.sh eval_seq1
+```
+
+To resume from explicit checkpoints:
+
+```bash
+SEQ1_CHECKPOINT=/path/to/seq1/models/best.checkpoint \
+  bash tools/run_superposition_pipeline.sh adapt
+
+ADAPTED_CHECKPOINT=/path/to/seq58/models/best.checkpoint \
+  bash tools/run_superposition_pipeline.sh eval
+```
+
+By default, outputs are written to `results/Superposition/v3`. The training and adaptation stages create separate log files, and each scene evaluation writes its own `run.log` and `summary.csv` inside the adapted Sequence 58 run directory.
 
 ## Notes
 
-- The repository does not include pretrained weights or generated results.
-- Please update absolute paths in the commands if your local directory structure is different.
-- Some CUDA/C++ extensions may need to match your local CUDA, PyTorch, and compiler versions.
+- The online adaptation pipeline described here is supervised: Sequence 58 ground-truth boxes are used for online updates.
+- Adjust absolute dataset and pretrained-weight paths in the corresponding YAML configs.
+- Outputs include baseline, periodic, best, and last checkpoints together with CSV metric summaries.
