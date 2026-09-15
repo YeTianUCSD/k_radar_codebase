@@ -1,0 +1,22 @@
+descriptor_bank: /home/code/hyperradar/k_radar_codebase/results/SceneDiscovery/descriptors/v1
+output_root: /home/code/hyperradar/k_radar_codebase/results/SceneDiscoveryFactorizedMLP
+experiment_name: weather_multimodal_low_latency_v5
+schema_version: kradar-weather-multimodal-low-latency/v5
+descriptor: mean_std
+modalities: [camera, lidar, radar]
+architectures: [camera, weather_multimodal_concat, weather_multimodal_gated]
+windows: [1, 3, 5]
+support_budgets: [3, 5, 10, 20, 30]
+seeds: [20260911, 20260912, 20260913, 20260914, 20260915]
+training:
+  batch_size: 64
+  epochs: 80
+  embedding_dim: 32
+  head_hidden_dim: 64
+  dropout: 0.3
+  learning_rate: 0.001
+  weight_decay: 0.0001
+selection:
+  absolute_accuracy_tolerance: 0.03
+  require_each_attribute_within_tolerance: true
+save_checkpoint_first_seed: true

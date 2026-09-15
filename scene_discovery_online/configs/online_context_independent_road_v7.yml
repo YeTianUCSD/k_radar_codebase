@@ -1,0 +1,31 @@
+checkpoint: /home/code/hyperradar/k_radar_codebase/results/SceneDiscoveryFactorizedMLP/independent_road_v7_260912_071110/checkpoints/independent_gated_spatial_lighting_budget30_window1_seed20260911.pt
+descriptor_bank: /home/code/hyperradar/k_radar_codebase/results/SceneDiscovery/descriptors/v1
+illumination_bank: /home/code/hyperradar/k_radar_codebase/results/SceneDiscovery/illumination_statistics/v1
+support_manifest: /home/code/hyperradar/k_radar_codebase/results/SceneDiscoveryFactorizedMLP/independent_road_v7_260912_071110/manifests/budget_30.csv
+output_root: /home/code/hyperradar/k_radar_codebase/results/SceneDiscoveryOnlineV7
+descriptor: mean_std
+sequences: [1, 35, 46, 19, 58, 5, 22, 34, 9, 38]
+base_sequence: 1
+stream_seed: 20260911
+inference_batch_size: 256
+device: auto
+
+online:
+  decision_windows: [5]
+  # Existing Context: at least 4/5 votes for 3 consecutive checks.
+  confirmation_frames: 3
+  majority_ratio: 0.8
+  # New Context: unanimous 5/5 votes for 5 consecutive checks.
+  new_context_confirmation_frames: 5
+  new_context_majority_ratio: 1.0
+  confidence_policy: enforce
+  confidence:
+    weather: 0.9
+    road: 0.9
+    lighting: 0.9
+  pause_update_when_pending: true
+
+evaluation:
+  stable_grace_frames: 10
+  change_tolerance_frames: 20
+  expected_context_count: 10

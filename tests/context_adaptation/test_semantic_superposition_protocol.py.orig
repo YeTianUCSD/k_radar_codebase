@@ -1,0 +1,82 @@
+from pathlib import Path
+import tempfile
+import unittest
+
+import torch
+
+from context_adaptation.semantic_superposition.protocol import (
+    build_visits,
+    canonical_sample_id,
+    exclude_dataset_samples,
+    load_excluded_support_ids,
+    routed_context_hook,
+)
+from context_adaptation.semantic_superposition.replay_buffer import PendingReplayBuffer
+
+
+class DatasetStub:
+    def __init__(self):
+        self.list_dict_item = [
+            {"meta": {"seq": "35", "split": "train", "idx": {"rdr": "00006"}}},
+            {"meta": {"seq": "35", "split": "train", "idx": {"rdr": "00007"}}},
+        ]
+
+
+class SemanticSuperpositionProtocolTest(unittest.TestCase):
+    def test_support_exclusion_happens_on_metadata_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "manifest.csv"
+            manifest.write_text(
+                "sample_id,role\nseq35_train_rdr00006,support_train\n"
+                "seq35_train_rdr00007,support_candidate\n"
+            )
+            ids = load_excluded_support_ids(manifest)
+            dataset = DatasetStub()
+            audit = exclude_dataset_samples(dataset, ids, "train")
+        self.assertEqual(audit["before"], 2)
+        self.assertEqual(audit["excluded"], 1)
+        self.assertEqual(audit["after"], 1)
+        self.assertEqual(dataset.list_dict_item[0]["meta"]["idx"]["rdr"], "00007")
+
+    def test_three_visits_are_deterministic_and_test_is_read_only(self):
+        left = build_visits(["a", "b", "c"], seed=17)
+        right = build_visits(["a", "b", "c"], seed=17)
+        self.assertEqual(left, right)
+        self.assertEqual([visit.split for visit in left], ["train", "train", "test"])
+        self.assertEqual([visit.update_enabled for visit in left], [True, True, False])
+        self.assertTrue(all(sorted(visit.order) == ["a", "b", "c"] for visit in left))
+
+    def test_bad_explicit_visit_order_is_rejected(self):
+        with self.assertRaises(ValueError):
+            build_visits(["a", "b"], seed=1, specifications=[
+                {"NAME": "test", "SPLIT": "test", "UPDATE": False, "ORDER": ["a", "a"]}
+            ])
+
+    def test_routed_hook_sets_context_per_sample(self):
+        class Network(torch.nn.Module):
+            def forward(self, batch):
+                return batch["scene_context"]
+        network = Network()
+        batch = {"meta": [{"seq": "5", "split": "test", "idx": {"rdr": "00042"}}]}
+        with routed_context_hook(network, {"seq5_test_rdr00042": "context_0003"}, "test"):
+            self.assertEqual(network(batch), "context_0003")
+
+    def test_replay_round_trip_preserves_pending_frames(self):
+        source = PendingReplayBuffer(max_frames=3, storage_dtype="float16")
+        source.append(step=2, semantic_key=("normal", "urban", "day"),
+                      encoded={"x": torch.tensor([1.0])}, sample_id="sample")
+        target = PendingReplayBuffer(max_frames=3, storage_dtype="float16")
+        target.load_state_dict(source.state_dict())
+        frame = target.matching(("normal", "urban", "day"))[0]
+        self.assertEqual((frame.step, frame.sample_id), (2, "sample"))
+        self.assertEqual(frame.encoded_cpu["x"].dtype, torch.float16)
+
+    def test_canonical_sample_id_matches_feature_bank_manifest(self):
+        self.assertEqual(
+            canonical_sample_id("seq35", "train", "00006"),
+            "seq35_train_rdr00006",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,230 @@
+"""Leakage-resistant utilities for independent semantic-attribute evaluation."""
+
+from __future__ import annotations
+
+from typing import Dict, Mapping, Sequence
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
+
+from .attributes import ATTRIBUTES
+
+
+def build_attribute_support_matrix(
+    scene_table: pd.DataFrame,
+    minimum_support_scenes: int = 1,
+) -> pd.DataFrame:
+    """Report which held-out sequences remain learnable for each attribute."""
+    if minimum_support_scenes < 1:
+        raise ValueError("minimum_support_scenes must be positive")
+    required = {"sequence", *ATTRIBUTES}
+    missing = required - set(scene_table.columns)
+    if missing:
+        raise ValueError(f"scene_table is missing columns: {sorted(missing)}")
+    if scene_table["sequence"].astype(str).duplicated().any():
+        raise ValueError("scene_table must contain one row per sequence")
+
+    table = scene_table.copy().reset_index(drop=True)
+    table["sequence"] = table["sequence"].astype(str)
+    rows = []
+    for _, held in table.iterrows():
+        remaining = table[~table["sequence"].eq(held["sequence"])]
+        row = {"held_out_sequence": held["sequence"]}
+        supported = []
+        for attribute in ATTRIBUTES:
+            count = int(remaining[attribute].eq(held[attribute]).sum())
+            is_supported = count >= minimum_support_scenes
+            row[f"true_{attribute}"] = held[attribute]
+            row[f"{attribute}_support_scenes"] = count
+            row[f"{attribute}_supported"] = is_supported
+            supported.append(is_supported)
+        row["true_semantic_key"] = "|".join(str(held[name]) for name in ATTRIBUTES)
+        row["joint_supported"] = all(supported)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def eligible_sequences(support_matrix: pd.DataFrame, attribute: str) -> list:
+    if attribute not in ATTRIBUTES:
+        raise ValueError(f"Unknown attribute {attribute!r}")
+    column = f"{attribute}_supported"
+    return support_matrix.loc[
+        support_matrix[column], "held_out_sequence"
+    ].astype(str).tolist()
+
+
+def sequence_balanced_metrics(
+    truth: Sequence[object],
+    prediction: Sequence[object],
+    sequences: Sequence[object],
+) -> Dict[str, float]:
+    """Compute frame metrics plus metrics giving every sequence total weight one."""
+    truth = np.asarray(truth).astype(str)
+    prediction = np.asarray(prediction).astype(str)
+    sequences = np.asarray(sequences).astype(str)
+    if not (len(truth) == len(prediction) == len(sequences)) or len(truth) == 0:
+        raise ValueError("truth, prediction, and sequences must be non-empty and aligned")
+    counts = pd.Series(sequences).value_counts()
+    weights = np.asarray([1.0 / counts[value] for value in sequences], dtype=np.float64)
+    per_sequence = [
+        float(np.mean(prediction[sequences == sequence] == truth[sequences == sequence]))
+        for sequence in pd.unique(sequences)
+    ]
+    true_classes = np.unique(truth)
+    weighted_recalls = [
+        float(np.average(prediction[truth == label] == truth[truth == label], weights=weights[truth == label]))
+        for label in true_classes
+    ]
+    return {
+        "samples": int(len(truth)),
+        "sequences": int(len(counts)),
+        "frame_accuracy": float(accuracy_score(truth, prediction)),
+        "sequence_accuracy": float(np.mean(per_sequence)),
+        "sequence_balanced_accuracy": float(np.mean(weighted_recalls)),
+        "sequence_macro_f1": float(
+            f1_score(
+                truth,
+                prediction,
+                average="macro",
+                sample_weight=weights,
+                zero_division=0,
+            )
+        ),
+    }
+
+
+def sequence_balanced_per_class_metrics(
+    truth: Sequence[object],
+    prediction: Sequence[object],
+    sequences: Sequence[object],
+) -> pd.DataFrame:
+    """Per-class scores with every sequence contributing total weight one."""
+    truth = np.asarray(truth).astype(str)
+    prediction = np.asarray(prediction).astype(str)
+    sequences = np.asarray(sequences).astype(str)
+    counts = pd.Series(sequences).value_counts()
+    weights = np.asarray([1.0 / counts[value] for value in sequences], dtype=np.float64)
+    labels = sorted(set(truth) | set(prediction))
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        truth, prediction, labels=labels, sample_weight=weights, zero_division=0
+    )
+    rows = []
+    for label, p_value, r_value, f_value in zip(labels, precision, recall, f1):
+        mask = truth == label
+        rows.append({
+            "class": label,
+            "precision": float(p_value),
+            "recall": float(r_value),
+            "f1": float(f_value),
+            "support_sequences": int(len(np.unique(sequences[mask]))),
+            "support_frames": int(mask.sum()),
+        })
+    return pd.DataFrame(rows)
+
+
+def sequence_balanced_confusion(
+    truth: Sequence[object],
+    prediction: Sequence[object],
+    sequences: Sequence[object],
+) -> pd.DataFrame:
+    """Row-normalized confusion after giving every sequence total weight one."""
+    truth = np.asarray(truth).astype(str)
+    prediction = np.asarray(prediction).astype(str)
+    sequences = np.asarray(sequences).astype(str)
+    counts = pd.Series(sequences).value_counts()
+    weights = np.asarray([1.0 / counts[value] for value in sequences], dtype=np.float64)
+    weighted = pd.DataFrame({"truth": truth, "prediction": prediction, "weight": weights})
+    matrix = weighted.pivot_table(
+        index="truth", columns="prediction", values="weight",
+        aggfunc="sum", fill_value=0.0,
+    )
+    return matrix.div(matrix.sum(axis=1), axis=0)
+
+
+def per_sequence_accuracy(
+    truth: Sequence[object],
+    prediction: Sequence[object],
+    sequences: Sequence[object],
+) -> pd.DataFrame:
+    frame = pd.DataFrame({
+        "sequence": np.asarray(sequences).astype(str),
+        "truth": np.asarray(truth).astype(str),
+        "prediction": np.asarray(prediction).astype(str),
+    })
+    if frame.empty:
+        raise ValueError("Cannot summarize empty predictions")
+    frame["correct"] = frame["truth"].eq(frame["prediction"])
+    return frame.groupby("sequence", as_index=False).agg(
+        true_label=("truth", "first"),
+        samples=("correct", "size"),
+        accuracy=("correct", "mean"),
+    )
+
+
+def align_attribute_predictions(
+    predictions: Mapping[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """Inner-join independently windowed heads on the same causal frame anchor."""
+    if set(predictions) != set(ATTRIBUTES):
+        raise ValueError(f"predictions must contain exactly {list(ATTRIBUTES)}")
+    keys = ["held_out_sequence", "sequence", "window_end_row"]
+    aligned = None
+    for attribute in ATTRIBUTES:
+        frame = predictions[attribute].copy()
+        required = {
+            *keys,
+            f"true_{attribute}",
+            f"predicted_{attribute}",
+            f"{attribute}_confidence",
+        }
+        missing = required - set(frame.columns)
+        if missing:
+            raise ValueError(f"{attribute} predictions are missing {sorted(missing)}")
+        if frame.duplicated(keys).any():
+            raise ValueError(f"{attribute} predictions contain duplicate causal anchors")
+        keep = keys + [
+            f"true_{attribute}",
+            f"predicted_{attribute}",
+            f"{attribute}_confidence",
+        ]
+        optional = [
+            column for column in frame.columns
+            if column == f"{attribute}_accepted"
+            or column.startswith(f"{attribute}_prob_")
+        ]
+        keep.extend(column for column in optional if column not in keep)
+        aligned = frame[keep] if aligned is None else aligned.merge(
+            frame[keep], on=keys, how="inner", validate="one_to_one"
+        )
+    aligned = aligned.sort_values(keys).reset_index(drop=True)
+    if aligned.empty:
+        raise ValueError("Attribute heads have no common causal prediction anchors")
+    aligned["true_semantic_key"] = aligned.apply(
+        lambda row: "|".join(str(row[f"true_{name}"]) for name in ATTRIBUTES), axis=1
+    )
+    aligned["predicted_semantic_key"] = aligned.apply(
+        lambda row: "|".join(
+            str(row[f"predicted_{name}"]) for name in ATTRIBUTES
+        ),
+        axis=1,
+    )
+    aligned["joint_confidence_min"] = aligned[
+        [f"{name}_confidence" for name in ATTRIBUTES]
+    ].min(axis=1)
+    correct_columns = []
+    for attribute in ATTRIBUTES:
+        column = f"{attribute}_correct"
+        aligned[column] = aligned[f"true_{attribute}"].eq(
+            aligned[f"predicted_{attribute}"]
+        )
+        correct_columns.append(column)
+    aligned["exact_match"] = aligned[correct_columns].all(axis=1)
+    error_count = (~aligned[correct_columns]).sum(axis=1)
+    aligned["error_type"] = "exact_match"
+    for attribute in ATTRIBUTES:
+        only = (~aligned[f"{attribute}_correct"]) & error_count.eq(1)
+        aligned.loc[only, "error_type"] = f"{attribute}_only"
+    aligned.loc[error_count.ge(2), "error_type"] = "multiple_attributes"
+    return aligned
+

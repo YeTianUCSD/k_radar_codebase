@@ -1,0 +1,93 @@
+EXPERIMENT:
+  NAME: automatic_semantic_superposition_best_parent_causal_v3_all_train
+  BASE_CONFIG: ./configs/ASF_v2_0_seq1_psp.yml
+  RESULT_ROOT: ./results/AutomaticSemanticSuperposition/10scenes_seq1_60_40
+
+BASE:
+  NAME: seq1
+  SEQUENCE: "1"
+  CHECKPOINT_LOAD_POLICY: compatible_base_context
+
+SCENES:
+  - {NAME: seq35, SEQUENCE: "35"}
+  - {NAME: seq46, SEQUENCE: "46"}
+  - {NAME: seq19, SEQUENCE: "19"}
+  - {NAME: seq58, SEQUENCE: "58"}
+  - {NAME: seq5,  SEQUENCE: "5"}
+  - {NAME: seq22, SEQUENCE: "22"}
+  - {NAME: seq34, SEQUENCE: "34"}
+  - {NAME: seq9,  SEQUENCE: "9"}
+  - {NAME: seq38, SEQUENCE: "38"}
+
+DATA:
+  ONLINE_BATCH_SIZE: 1
+  NUM_WORKERS: 0
+  LIST_DIR_KRADAR: [/home/code/hyperradar/dataset/k_radar]
+  TRAIN_SPLIT: ./resources/split/time_10scenes_60_40/train.txt
+  TEST_SPLIT: ./resources/split/time_10scenes_60_40/test.txt
+
+# Only train_first adapts the detector; both revisits are read-only evaluations.
+
+# The 30 attribute-labelled support frames per scene remain in both train
+# visits. DataLoader reads them at their original temporal positions, and their
+# available 3D boxes may supervise detector adaptation. Nothing is prepended at
+# a hidden scene boundary. The test split remains read-only.
+STREAM:
+  SUPPORT_MANIFEST: ./results/SceneDiscoveryFactorizedMLP/independent_road_v7_260912_071110/manifests/budget_30.csv
+  SUPPORT_ROLES: [support_train]
+  EXCLUDE_ROLES: []
+  EXPECTED_EXCLUDED_PER_SCENE: 0
+  ORDER_SEED: 20260913
+  VISITS:
+    - {NAME: train_first, SPLIT: train, UPDATE: true}
+    - {NAME: train_revisit, SPLIT: train, UPDATE: false}
+    - {NAME: test_revisit, SPLIT: test, UPDATE: false}
+
+SEMANTIC_ROUTER:
+  ATTRIBUTE_CHECKPOINT: ./results/SceneDiscoveryFactorizedMLP/independent_road_v7_260912_071110/checkpoints/independent_gated_spatial_lighting_budget30_window1_seed20260911.pt
+  DEVICE: auto
+  BASE_KEY: [normal, urban, night]
+  FEATURE_KEYS: {camera: cam_bev_feat, lidar: spatial_features_2d, radar: bev_feat}
+  DECISION_WINDOW: 5
+  CONFIRMATION_FRAMES: 3
+  MAJORITY_RATIO: 0.8
+  NEW_CONTEXT_CONFIRMATION_FRAMES: 5
+  NEW_CONTEXT_MAJORITY_RATIO: 1.0
+  CONFIDENCE: {weather: 0.9, road: 0.9, lighting: 0.9}
+  SCENE_KEYS:
+    seq1:  [normal, urban, night]
+    seq35: [sleet, parking_lot, night]
+    seq46: [heavy_snow, highway, night]
+    seq19: [normal, alleyway, day]
+    seq58: [heavy_snow, urban, day]
+    seq5:  [normal, urban, day]
+    seq22: [overcast, urban, night]
+    seq34: [rain, countryside, night]
+    seq9:  [normal, highway, day]
+    seq38: [fog, mountain, day]
+
+PARENT_SELECTION:
+  METRIC: mean_detection_loss
+  CANDIDATES: all_registered_contexts
+
+PENDING_REPLAY: {ENABLED: true, MAX_FRAMES: 16, STORAGE_DEVICE: cpu, STORAGE_DTYPE: float16}
+
+ONLINE:
+  TRAINABLE_SCOPE: fuser_head
+  OPTIMIZER: adamw
+  LR: 0.0001
+  WEIGHT_DECAY: 0.0
+  MOMENTUM: 0.9
+  GRAD_CLIP: 0.0
+  # Strictly causal: no hidden scene boundary or test AP selects/restores weights.
+  STAGE_SELECTION: last
+  EVAL_EVERY_UPDATES: 0
+
+EVALUATION:
+  CONF_THR: 0.3
+  BEST_METRIC_CLS: auto
+  BEST_METRIC_KIND: 3d
+  BEST_METRIC_IOUS: [0.3, 0.5]
+  BACKTEST_POLICY: final
+
+AUDIT: {ENABLED: true, STRICT: true, INHERITANCE_ATOL: 1.0e-6}

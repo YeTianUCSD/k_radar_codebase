@@ -1,0 +1,8 @@
+STREAM:
+  - CONFIG: ./configs/ASF_v2_0_seq58_adapt_psp.yml
+    SPLIT: train
+    NAME_FOR_METRICS_ONLY: seq58
+
+  - CONFIG: ./configs/ASF_v2_0_seq1_psp.yml
+    SPLIT: train
+    NAME_FOR_METRICS_ONLY: normal_seq1_return

@@ -1,0 +1,23 @@
+descriptor_bank: /home/code/hyperradar/k_radar_codebase/results/SceneDiscovery/descriptors/v1
+output_root: /home/code/hyperradar/k_radar_codebase/results/SceneDiscoveryFactorizedMLP
+descriptor: mean_std
+support:
+  budgets: [10, 20, 30]
+  support_pool: 30
+  validation_frames: 20
+  guard_frames: 10
+model_search:
+  architectures: [camera, concat, gated]
+  embedding_dims: [32, 64]
+  head_hidden_dims: [64]
+  dropouts: [0.1, 0.3]
+  learning_rates: [0.0003, 0.001]
+  weight_decay: 0.0001
+training:
+  batch_size: 64
+  max_epochs: 200
+  patience: 20
+  search_seed: 20260909
+  final_seeds: [20260909, 20260910, 20260911]
+evaluation:
+  windows: [1, 5, 10]

@@ -1,0 +1,24 @@
+STREAM:
+  - CONFIG: ./configs/ASF_v2_0_seq1_eval_psp.yml
+    SPLIT: test
+    START: 0
+    STOP: 80
+    NAME_FOR_METRICS_ONLY: normal
+
+  - CONFIG: ./configs/ASF_v2_0_seq58_eval_psp.yml
+    SPLIT: test
+    START: 0
+    STOP: 80
+    NAME_FOR_METRICS_ONLY: seq58
+
+  - CONFIG: ./configs/ASF_v2_0_seq1_eval_psp.yml
+    SPLIT: test
+    START: 80
+    STOP: 160
+    NAME_FOR_METRICS_ONLY: normal
+
+  - CONFIG: ./configs/ASF_v2_0_seq58_eval_psp.yml
+    SPLIT: test
+    START: 80
+    STOP: 160
+    NAME_FOR_METRICS_ONLY: seq58

@@ -1,0 +1,26 @@
+checkpoint: /home/code/hyperradar/k_radar_codebase/results/SceneDiscoveryFactorizedMLP/weather_multimodal_low_latency_v5_260911_075653/checkpoints/weather_multimodal_gated_budget30_window1_seed20260911.pt
+descriptor_bank: /home/code/hyperradar/k_radar_codebase/results/SceneDiscovery/descriptors/v1
+support_manifest: /home/code/hyperradar/k_radar_codebase/results/SceneDiscoveryFactorizedMLP/weather_multimodal_low_latency_v5_260911_075653/manifests/budget_30.csv
+output_root: /home/code/hyperradar/k_radar_codebase/results/SceneDiscoveryOnline
+descriptor: mean_std
+sequences: [1, 35, 46, 19, 58, 5, 22, 34, 9, 38]
+base_sequence: 1
+stream_seed: 20260911
+inference_batch_size: 256
+device: auto
+
+online:
+  decision_windows: [5, 10]
+  confirmation_frames: 3
+  majority_ratio: 0.8
+  confidence_policy: observe_only
+  confidence:
+    weather: 0.0
+    road: 0.0
+    lighting: 0.0
+  pause_update_when_pending: true
+
+evaluation:
+  stable_grace_frames: 10
+  change_tolerance_frames: 20
+  expected_context_count: 10

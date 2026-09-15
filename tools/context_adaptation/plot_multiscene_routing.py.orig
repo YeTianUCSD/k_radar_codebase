@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""Create diagnostic figures for a multi-scene routing-only experiment."""
+
+import argparse
+import csv
+import json
+from collections import defaultdict
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import yaml
+
+
+DEFAULT_SEQUENCE_ORDER = [
+    "seq5", "seq1", "seq22", "seq34", "seq9",
+    "seq38", "seq35", "seq46", "seq58", "seq19",
+]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--discovery_csv", type=Path, required=True)
+    parser.add_argument("--return_csv", type=Path, required=True)
+    parser.add_argument("--metrics_yml", type=Path, required=True)
+    parser.add_argument("--output_dir", type=Path, required=True)
+    parser.add_argument("--dpi", type=int, default=220)
+    return parser.parse_args()
+
+
+def load_rows(path):
+    rows = []
+    with path.open(newline="") as handle:
+        for row in csv.DictReader(handle):
+            row["step_idx"] = int(row["step_idx"])
+            row["segment_index"] = int(row["segment_index"])
+            row["segment_local_step"] = int(row["segment_local_step"])
+            row["active_context_id"] = int(row["active_context_id"])
+            row["created_context_id"] = (
+                int(row["created_context_id"])
+                if row["created_context_id"].strip() else None
+            )
+            row["raw_feature"] = np.asarray(
+                json.loads(row["raw_projected_feature_json"]), dtype=float
+            )
+            row["smoothed_feature"] = np.asarray(
+                json.loads(row["smoothed_projected_feature_json"]), dtype=float
+            )
+            rows.append(row)
+    return rows
+
+
+def ordered_labels(metrics, discovery_rows, return_rows):
+    labels = list(metrics.get("expected_labels", DEFAULT_SEQUENCE_ORDER))
+    observed = {
+        row["segment_name_for_metrics_only"]
+        for row in discovery_rows + return_rows
+    }
+    labels.extend(sorted(observed.difference(labels)))
+    return labels
+
+
+def save(fig, path, dpi):
+    fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+def sequence_palette(labels):
+    cmap = plt.get_cmap("tab10")
+    return {label: cmap(index % 10) for index, label in enumerate(labels)}
+
+
+def plot_projection(rows, labels, colors, output_path, dpi):
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6), constrained_layout=True)
+    for ax, key, title in zip(
+        axes,
+        ("raw_feature", "smoothed_feature"),
+        ("Raw projected descriptors", "EMA-smoothed projected descriptors"),
+    ):
+        for label in labels:
+            values = np.asarray([
+                row[key] for row in rows
+                if row["segment_name_for_metrics_only"] == label
+            ])
+            if len(values) == 0:
+                continue
+            ax.scatter(
+                values[:, 0], values[:, 1], s=10, alpha=0.30,
+                color=colors[label], linewidths=0, label=label,
+            )
+            mean = values.mean(axis=0)
+            ax.scatter(
+                mean[0], mean[1], s=90, marker="X", color=colors[label],
+                edgecolor="black", linewidth=0.7, zorder=5,
+            )
+        ax.axhline(0, color="0.85", linewidth=0.7, zorder=0)
+        ax.axvline(0, color="0.85", linewidth=0.7, zorder=0)
+        ax.set_title(title)
+        ax.set_xlabel("Projection dimension 1")
+        ax.set_ylabel("Projection dimension 2")
+        ax.grid(alpha=0.15)
+    handles, legend_labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles, legend_labels, loc="lower center", ncol=5,
+        bbox_to_anchor=(0.5, -0.05), frameon=False,
+    )
+    fig.suptitle("Discovery stream: 2D descriptor distribution", fontsize=15)
+    save(fig, output_path, dpi)
+
+
+def segment_spans(rows):
+    spans = []
+    start = 0
+    current = rows[0]["segment_index"]
+    for index, row in enumerate(rows[1:], 1):
+        if row["segment_index"] != current:
+            spans.append((start, index - 1, rows[start]["segment_name_for_metrics_only"]))
+            start = index
+            current = row["segment_index"]
+    spans.append((start, len(rows) - 1, rows[start]["segment_name_for_metrics_only"]))
+    return spans
+
+
+def plot_timeline(discovery, returned, labels, colors, output_path, dpi):
+    fig, axes = plt.subplots(2, 1, figsize=(17, 9), constrained_layout=True)
+    for ax, rows, phase in zip(axes, (discovery, returned), ("Discovery", "Return")):
+        x = np.arange(len(rows))
+        y = np.asarray([row["active_context_id"] for row in rows])
+        pending = np.asarray([row["status"] == "pending" for row in rows])
+        for left, right, label in segment_spans(rows):
+            ax.axvspan(left, right, color=colors[label], alpha=0.09, linewidth=0)
+            ax.text(
+                (left + right) / 2, 1.015, label, color=colors[label],
+                ha="center", va="bottom", fontsize=8,
+                transform=ax.get_xaxis_transform(),
+            )
+        ax.plot(x, y, color="#1f2937", linewidth=0.7, alpha=0.85)
+        ax.scatter(x[~pending], y[~pending], s=4, color="#1f2937", alpha=0.55)
+        ax.scatter(x[pending], y[pending], s=7, color="#f59e0b", alpha=0.75,
+                   label="pending")
+        creation_x = [i for i, row in enumerate(rows) if row["created_context_id"] is not None]
+        creation_y = [rows[i]["created_context_id"] for i in creation_x]
+        if creation_x:
+            ax.scatter(creation_x, creation_y, marker="*", s=110,
+                       color="#dc2626", edgecolor="white", linewidth=0.6,
+                       zorder=5, label="context created")
+        ax.set_ylabel("Active context ID")
+        ax.set_title(f"{phase} phase")
+        ax.set_yticks(sorted(set(y).union(creation_y)))
+        ax.grid(axis="y", alpha=0.2)
+        ax.legend(loc="upper right", frameon=False)
+    axes[-1].set_xlabel("Frame index within phase")
+    fig.suptitle("Online context routing timeline", fontsize=15)
+    save(fig, output_path, dpi)
+
+
+def confusion_array(phase_metrics, labels):
+    matrix_data = phase_metrics.get("confusion_matrix", {})
+    predicted = labels + ["unmapped"]
+    matrix = np.zeros((len(labels), len(predicted)), dtype=float)
+    for i, truth in enumerate(labels):
+        for prediction, count in matrix_data.get(truth, {}).items():
+            column = predicted.index(prediction) if prediction in labels else len(labels)
+            matrix[i, column] += float(count)
+    sums = matrix.sum(axis=1, keepdims=True)
+    normalized = np.divide(matrix, sums, out=np.zeros_like(matrix), where=sums > 0)
+    return normalized, predicted
+
+
+def annotate_heatmap(ax, matrix, percent=True, threshold=0.005):
+    for row in range(matrix.shape[0]):
+        for column in range(matrix.shape[1]):
+            value = matrix[row, column]
+            if value < threshold:
+                continue
+            text_value = f"{100 * value:.0f}" if percent else f"{value:.0f}"
+            ax.text(
+                column, row, text_value, ha="center", va="center", fontsize=7,
+                color="white" if value > 0.55 else "black",
+            )
+
+
+def plot_confusion(metrics, labels, output_path, dpi):
+    fig, axes = plt.subplots(1, 2, figsize=(19, 7), constrained_layout=True)
+    image = None
+    for ax, phase in zip(axes, ("discovery", "return")):
+        matrix, predicted = confusion_array(metrics[phase], labels)
+        image = ax.imshow(matrix, cmap="Blues", vmin=0, vmax=1, aspect="auto")
+        annotate_heatmap(ax, matrix)
+        ax.set_xticks(np.arange(len(predicted)), predicted, rotation=45, ha="right")
+        ax.set_yticks(np.arange(len(labels)), labels)
+        ax.set_xlabel("Predicted sequence via creation mapping")
+        ax.set_ylabel("True sequence (evaluation only)")
+        ax.set_title(f"{phase.capitalize()} row-normalized confusion (%)")
+    fig.colorbar(image, ax=axes, fraction=0.025, pad=0.02, label="Fraction")
+    fig.suptitle("Strict scene-routing confusion matrices", fontsize=15)
+    save(fig, output_path, dpi)
+
+
+def plot_accuracy_pending(metrics, labels, output_path, dpi):
+    x = np.arange(len(labels))
+    width = 0.36
+    fig, axes = plt.subplots(2, 1, figsize=(15, 9), constrained_layout=True)
+    for ax, phase in zip(axes, ("discovery", "return")):
+        per_label = metrics[phase].get("per_label", {})
+        accuracy = [per_label.get(label, {}).get("accuracy", 0.0) for label in labels]
+        pending = [per_label.get(label, {}).get("pending_rate", 0.0) for label in labels]
+        bars_a = ax.bar(x - width / 2, accuracy, width, color="#2563eb", label="accuracy")
+        bars_p = ax.bar(x + width / 2, pending, width, color="#f59e0b", label="pending rate")
+        ax.bar_label(bars_a, labels=[f"{100*v:.0f}" for v in accuracy], fontsize=7, padding=2)
+        ax.bar_label(bars_p, labels=[f"{100*v:.0f}" for v in pending], fontsize=7, padding=2)
+        ax.set_ylim(0, 1.13)
+        ax.set_ylabel("Rate")
+        ax.set_title(
+            f"{phase.capitalize()} — overall stable accuracy: "
+            f"{100 * metrics[phase]['stable_frame_accuracy']:.1f}%"
+        )
+        ax.grid(axis="y", alpha=0.2)
+        ax.legend(frameon=False, ncol=2)
+        ax.set_xticks(x, labels)
+    axes[-1].set_xlabel("Sequence")
+    fig.suptitle("Per-sequence routing accuracy and pending rate", fontsize=15)
+    save(fig, output_path, dpi)
+
+
+def context_usage_array(phase_metrics, labels, context_ids):
+    result = np.zeros((len(labels), len(context_ids)), dtype=float)
+    label_index = {label: index for index, label in enumerate(labels)}
+    context_index = {context: index for index, context in enumerate(context_ids)}
+    for context, counts in phase_metrics.get("context_label_counts", {}).items():
+        context = int(context)
+        if context not in context_index:
+            continue
+        for label, count in counts.items():
+            if label in label_index:
+                result[label_index[label], context_index[context]] += float(count)
+    sums = result.sum(axis=1, keepdims=True)
+    return np.divide(result, sums, out=np.zeros_like(result), where=sums > 0)
+
+
+def plot_context_usage(metrics, labels, discovery, returned, output_path, dpi):
+    context_ids = sorted({
+        row["active_context_id"] for row in discovery + returned
+    }.union({
+        row["created_context_id"] for row in discovery + returned
+        if row["created_context_id"] is not None
+    }))
+    fig, axes = plt.subplots(1, 2, figsize=(18, 7), constrained_layout=True)
+    image = None
+    for ax, phase in zip(axes, ("discovery", "return")):
+        matrix = context_usage_array(metrics[phase], labels, context_ids)
+        image = ax.imshow(matrix, cmap="YlGnBu", vmin=0, vmax=1, aspect="auto")
+        annotate_heatmap(ax, matrix)
+        ax.set_xticks(np.arange(len(context_ids)), [str(item) for item in context_ids])
+        ax.set_yticks(np.arange(len(labels)), labels)
+        ax.set_xlabel("Active context ID")
+        ax.set_ylabel("True sequence (evaluation only)")
+        ax.set_title(f"{phase.capitalize()} context usage by sequence (%)")
+    fig.colorbar(image, ax=axes, fraction=0.025, pad=0.02, label="Fraction")
+    fig.suptitle("Context merging and fragmentation diagnostic", fontsize=15)
+    save(fig, output_path, dpi)
+
+
+def plot_creations(discovery, returned, colors, output_path, dpi):
+    fig, ax = plt.subplots(figsize=(16, 5), constrained_layout=True)
+    offset = 0
+    all_events = []
+    for phase, rows, marker in (("Discovery", discovery, "o"), ("Return", returned, "s")):
+        for index, row in enumerate(rows):
+            context = row["created_context_id"]
+            if context is None:
+                continue
+            label = row["segment_name_for_metrics_only"]
+            x = offset + index
+            all_events.append((x, context, label, phase, marker))
+        offset += len(rows)
+    boundary = len(discovery)
+    ax.axvspan(0, boundary, color="#dbeafe", alpha=0.35)
+    ax.axvspan(boundary, boundary + len(returned), color="#fef3c7", alpha=0.35)
+    ax.axvline(boundary, color="0.3", linestyle="--", linewidth=1)
+    for x, context, label, phase, marker in all_events:
+        ax.scatter(x, context, s=105, marker=marker, color=colors[label],
+                   edgecolor="black", linewidth=0.7, zorder=3)
+        ax.annotate(
+            f"C{context}\n{label}", (x, context), xytext=(0, 11),
+            textcoords="offset points", ha="center", fontsize=8,
+        )
+    ax.text(boundary / 2, 1.02, "Discovery", transform=ax.get_xaxis_transform(),
+            ha="center", fontweight="bold")
+    ax.text(boundary + len(returned) / 2, 1.02, "Return",
+            transform=ax.get_xaxis_transform(), ha="center", fontweight="bold")
+    ax.set_xlabel("Global stream frame")
+    ax.set_ylabel("Created context ID")
+    ax.set_yticks(sorted({event[1] for event in all_events}))
+    ax.grid(axis="y", alpha=0.2)
+    ax.set_title("Context creation events (color = true sequence for evaluation)")
+    save(fig, output_path, dpi)
+
+
+def write_manifest(path, args, outputs, metrics, discovery, returned):
+    manifest = {
+        "sources": {
+            "discovery_csv": str(args.discovery_csv.resolve()),
+            "return_csv": str(args.return_csv.resolve()),
+            "metrics_yml": str(args.metrics_yml.resolve()),
+        },
+        "frames": {"discovery": len(discovery), "return": len(returned)},
+        "headline_metrics": {
+            "contexts_after_discovery": metrics["discovery"].get("num_contexts"),
+            "discovery_stable_frame_accuracy": metrics["discovery"].get("stable_frame_accuracy"),
+            "return_stable_frame_accuracy": metrics["return"].get("stable_frame_accuracy"),
+            "return_false_context_creations": metrics["return"].get("false_context_creations"),
+            "overall_pass": metrics.get("pass_criteria", {}).get("overall_pass"),
+        },
+        "figures": [item.name for item in outputs],
+        "note": "Sequence labels are used only for offline evaluation and visualization.",
+    }
+    with path.open("w") as handle:
+        yaml.safe_dump(manifest, handle, sort_keys=False)
+
+
+def main():
+    args = parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    with args.metrics_yml.open() as handle:
+        metrics = yaml.safe_load(handle)
+    discovery = load_rows(args.discovery_csv)
+    returned = load_rows(args.return_csv)
+    if not discovery or not returned:
+        raise ValueError("Both discovery and return routing logs must contain rows")
+
+    labels = ordered_labels(metrics, discovery, returned)
+    colors = sequence_palette(labels)
+    outputs = [
+        args.output_dir / "01_discovery_projection_2d.png",
+        args.output_dir / "02_routing_timeline.png",
+        args.output_dir / "03_confusion_matrices.png",
+        args.output_dir / "04_accuracy_pending_by_sequence.png",
+        args.output_dir / "05_context_usage_by_sequence.png",
+        args.output_dir / "06_context_creation_timeline.png",
+    ]
+    plot_projection(discovery, labels, colors, outputs[0], args.dpi)
+    plot_timeline(discovery, returned, labels, colors, outputs[1], args.dpi)
+    plot_confusion(metrics, labels, outputs[2], args.dpi)
+    plot_accuracy_pending(metrics, labels, outputs[3], args.dpi)
+    plot_context_usage(metrics, labels, discovery, returned, outputs[4], args.dpi)
+    plot_creations(discovery, returned, colors, outputs[5], args.dpi)
+    write_manifest(
+        args.output_dir / "figures_manifest.yml", args, outputs,
+        metrics, discovery, returned,
+    )
+    print(f"Wrote {len(outputs)} figures to {args.output_dir}")
+    for output in outputs:
+        print(output)
+
+
+if __name__ == "__main__":
+    main()

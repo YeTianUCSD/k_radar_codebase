@@ -1,0 +1,147 @@
+"""Leakage-free benchmark stream and per-frame routed evaluation helpers."""
+
+from __future__ import annotations
+
+import csv
+import random
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Mapping, Sequence
+
+
+def canonical_sample_id(sequence: object, split: str, radar_index: object) -> str:
+    seq = str(sequence).lower()
+    if seq.startswith("seq"):
+        seq = seq[3:]
+    return f"seq{int(seq)}_{str(split).lower()}_rdr{str(radar_index)}"
+
+
+def sample_id_from_meta(meta: Mapping, split: str | None = None) -> str:
+    indexes = meta.get("idx", {})
+    resolved_split = str(split or meta.get("split", "")).lower()
+    if not resolved_split:
+        raise ValueError("sample metadata has no split")
+    return canonical_sample_id(meta["seq"], resolved_split, indexes["rdr"])
+
+
+def sample_id_from_batch(batch: Mapping, split: str | None = None) -> str:
+    metadata = batch.get("meta", ())
+    if not metadata:
+        raise ValueError("batch has no metadata")
+    return sample_id_from_meta(metadata[0], split)
+
+
+def load_excluded_support_ids(
+    manifest_path: str | Path,
+    *,
+    roles: Iterable[str] = ("support_train",),
+) -> set[str]:
+    path = Path(manifest_path).expanduser().resolve()
+    wanted = {str(role) for role in roles}
+    with path.open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        required = {"sample_id", "role"}
+        missing = required - set(reader.fieldnames or ())
+        if missing:
+            raise ValueError(f"support manifest lacks columns: {sorted(missing)}")
+        result = {
+            str(row["sample_id"]) for row in reader if str(row["role"]) in wanted
+        }
+    if not result:
+        raise ValueError(f"no excluded support samples found in {path}")
+    return result
+
+
+def exclude_dataset_samples(dataset, excluded_ids: set[str], split: str) -> dict:
+    """Filter a KRadar dataset before loading any tensors and return an audit."""
+    if not hasattr(dataset, "list_dict_item"):
+        raise TypeError("dataset has no list_dict_item metadata index")
+    before = len(dataset.list_dict_item)
+    kept = []
+    removed = []
+    for item in dataset.list_dict_item:
+        identifier = sample_id_from_meta(item["meta"], split)
+        if identifier in excluded_ids:
+            removed.append(identifier)
+        else:
+            kept.append(item)
+    dataset.list_dict_item = kept
+    return {
+        "split": str(split),
+        "before": before,
+        "after": len(kept),
+        "excluded": len(removed),
+        "excluded_ids": tuple(removed),
+    }
+
+
+@dataclass(frozen=True)
+class StreamVisit:
+    name: str
+    split: str
+    update_enabled: bool
+    order: tuple[str, ...]
+
+
+def build_visits(
+    scene_names: Sequence[str],
+    *,
+    seed: int,
+    specifications: Sequence[Mapping] | None = None,
+) -> tuple[StreamVisit, ...]:
+    specs = specifications or (
+        {"NAME": "train_first", "SPLIT": "train", "UPDATE": True},
+        {"NAME": "train_revisit", "SPLIT": "train", "UPDATE": True},
+        {"NAME": "test_revisit", "SPLIT": "test", "UPDATE": False},
+    )
+    known = tuple(str(name) for name in scene_names)
+    visits = []
+    for index, spec in enumerate(specs):
+        explicit = spec.get("ORDER")
+        if explicit is None:
+            order = list(known)
+            random.Random(int(seed) + index).shuffle(order)
+        else:
+            order = [str(value) for value in explicit]
+            if sorted(order) != sorted(known) or len(order) != len(known):
+                raise ValueError(
+                    f"STREAM.VISITS[{index}].ORDER must contain every target once"
+                )
+        split = str(spec.get("SPLIT", "train")).lower()
+        if split not in {"train", "test"}:
+            raise ValueError("stream visit split must be train or test")
+        visits.append(StreamVisit(
+            name=str(spec.get("NAME", f"visit_{index + 1}")),
+            split=split,
+            update_enabled=bool(spec.get("UPDATE", split == "train")),
+            order=tuple(order),
+        ))
+    if not visits or visits[-1].split != "test" or visits[-1].update_enabled:
+        raise ValueError("the final visit must be a read-only test visit")
+    return tuple(visits)
+
+
+@contextmanager
+def routed_context_hook(network, route_by_sample: Mapping[str, str], split: str):
+    """Set PSP context from sample metadata immediately before every forward."""
+    missing = set()
+
+    def hook(_module, inputs):
+        if not inputs or not isinstance(inputs[0], dict):
+            raise TypeError("routed evaluation expects network(batch_dict)")
+        batch = inputs[0]
+        identifier = sample_id_from_batch(batch, split)
+        context = route_by_sample.get(identifier)
+        if context is None:
+            missing.add(identifier)
+            raise KeyError(f"no recorded route for {identifier}")
+        batch["scene_context"] = context
+
+    handle = network.register_forward_pre_hook(hook)
+    try:
+        yield
+    finally:
+        handle.remove()
+    if missing:
+        raise RuntimeError(f"missing routed samples: {sorted(missing)[:8]}")

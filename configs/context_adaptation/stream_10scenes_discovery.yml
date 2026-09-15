@@ -1,0 +1,50 @@
+STREAM:
+  - CONFIG: ./configs/ASF_v2_0_seq5_psp.yml
+    SEQUENCES: ['5']
+    SPLIT: train
+    NAME_FOR_METRICS_ONLY: seq5
+
+  - CONFIG: ./configs/ASF_v2_0_seq5_psp.yml
+    SEQUENCES: ['1']
+    SPLIT: train
+    NAME_FOR_METRICS_ONLY: seq1
+
+  - CONFIG: ./configs/ASF_v2_0_seq5_psp.yml
+    SEQUENCES: ['22']
+    SPLIT: train
+    NAME_FOR_METRICS_ONLY: seq22
+
+  - CONFIG: ./configs/ASF_v2_0_seq5_psp.yml
+    SEQUENCES: ['34']
+    SPLIT: train
+    NAME_FOR_METRICS_ONLY: seq34
+
+  - CONFIG: ./configs/ASF_v2_0_seq5_psp.yml
+    SEQUENCES: ['9']
+    SPLIT: train
+    NAME_FOR_METRICS_ONLY: seq9
+
+  - CONFIG: ./configs/ASF_v2_0_seq5_psp.yml
+    SEQUENCES: ['38']
+    SPLIT: train
+    NAME_FOR_METRICS_ONLY: seq38
+
+  - CONFIG: ./configs/ASF_v2_0_seq5_psp.yml
+    SEQUENCES: ['35']
+    SPLIT: train
+    NAME_FOR_METRICS_ONLY: seq35
+
+  - CONFIG: ./configs/ASF_v2_0_seq5_psp.yml
+    SEQUENCES: ['46']
+    SPLIT: train
+    NAME_FOR_METRICS_ONLY: seq46
+
+  - CONFIG: ./configs/ASF_v2_0_seq5_psp.yml
+    SEQUENCES: ['58']
+    SPLIT: train
+    NAME_FOR_METRICS_ONLY: seq58
+
+  - CONFIG: ./configs/ASF_v2_0_seq5_psp.yml
+    SEQUENCES: ['19']
+    SPLIT: train
+    NAME_FOR_METRICS_ONLY: seq19

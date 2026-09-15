@@ -24,6 +24,15 @@ def make_runtime_config(path_config, args):
     max_epoch = args.epochs if args.epochs is not None else args.max_epoch
     full_eval_every = args.full_eval_every if args.full_eval_every is not None else args.val_per_epoch_full
 
+    if args.sequences is not None:
+        normalized_sequences = []
+        for value in args.sequences:
+            sequence = str(int(str(value).lower().replace('seq', '', 1)))
+            if sequence not in normalized_sequences:
+                normalized_sequences.append(sequence)
+        cfg['DATASET']['portion'] = normalized_sequences
+        is_overridden = True
+
     if output_root is not None:
         cfg['GENERAL']['LOGGING']['PATH_LOGGING'] = output_root
         is_overridden = True
@@ -112,6 +121,8 @@ if __name__ == '__main__':
                         help='Semantic run name. Final dir is <run_name>_exp_YYMMDD_HHMMSS')
     parser.add_argument('--epochs', type=int, default=None,
                         help='Number of training epochs. Alias of --max_epoch')
+    parser.add_argument('--sequences', type=str, nargs='+', default=None,
+                        help='Override DATASET.portion, e.g. --sequences 35')
     parser.add_argument('--full_eval_every', type=int, default=None,
                         help='Run full validation every N epochs. Alias of --val_per_epoch_full')
     parser.add_argument('--no_save_every_epoch', action='store_true',
@@ -160,6 +171,7 @@ if __name__ == '__main__':
         print(f"* Override PATH_LOGGING = {runtime_cfg['GENERAL']['LOGGING']['PATH_LOGGING']}")
         print(f"* Override NAME = {runtime_cfg['GENERAL']['NAME']}")
         print(f"* Override MAX_EPOCH = {runtime_cfg['OPTIMIZER']['MAX_EPOCH']}")
+        print(f"* Override DATASET.portion = {runtime_cfg['DATASET']['portion']}")
         print(f"* Override BATCH_SIZE = {runtime_cfg['OPTIMIZER']['BATCH_SIZE']}")
         print(f"* Override NUM_WORKERS = {runtime_cfg['OPTIMIZER']['NUM_WORKERS']}")
         print(f"* Override IS_CONSIDER_VAL_SUBSET = {runtime_cfg['VAL']['IS_CONSIDER_VAL_SUBSET']}")

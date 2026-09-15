@@ -1,0 +1,28 @@
+descriptor_bank: /home/code/hyperradar/k_radar_codebase/results/SceneDiscovery/descriptors/v1
+output_root: /home/code/hyperradar/k_radar_codebase/results/SceneDiscoveryFactorizedMLP
+experiment_name: spatial_lighting_v6
+schema_version: kradar-spatial-lighting/v6
+descriptor: mean_std
+modalities: [camera, lidar, radar]
+illumination:
+  dataset_root: /home/code/hyperradar/dataset/k_radar
+  bank: /home/code/hyperradar/k_radar_codebase/results/SceneDiscovery/illumination_statistics/v1
+  image_width: 320
+  image_height: 90
+architectures: [weather_multimodal_gated_spatial_lighting]
+windows: [1]
+support_budgets: [30]
+seeds: [20260911, 20260912, 20260913, 20260914, 20260915]
+training:
+  batch_size: 64
+  epochs: 80
+  embedding_dim: 32
+  illumination_embedding_dim: 16
+  head_hidden_dim: 64
+  dropout: 0.3
+  learning_rate: 0.001
+  weight_decay: 0.0001
+selection:
+  absolute_accuracy_tolerance: 0.03
+  require_each_attribute_within_tolerance: true
+save_checkpoint_first_seed: true

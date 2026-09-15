@@ -170,8 +170,4 @@ ADAPTED_CHECKPOINT=/path/to/seq58/models/best.checkpoint \
 
 By default, outputs are written to `results/Superposition/v3`. The training and adaptation stages create separate log files, and each scene evaluation writes its own `run.log` and `summary.csv` inside the adapted Sequence 58 run directory.
 
-## Notes
 
-- The online adaptation pipeline described here is supervised: Sequence 58 ground-truth boxes are used for online updates.
-- Adjust absolute dataset and pretrained-weight paths in the corresponding YAML configs.
-- Outputs include baseline, periodic, best, and last checkpoints together with CSV metric summaries.

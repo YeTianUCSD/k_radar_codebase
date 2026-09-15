@@ -1,0 +1,639 @@
+"""Supervised online adaptation with automatic dynamic context discovery."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import shutil
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterable
+
+import torch
+import yaml
+from tqdm import tqdm
+
+
+FILE = Path(__file__).resolve()
+ROOT = FILE.parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from context_adaptation.checkpoint import (
+    load_context_checkpoint,
+    restore_model_and_context_state,
+    save_context_checkpoint,
+    validate_optimizer_resume,
+)
+from context_adaptation.context_transaction import create_context_transaction
+from context_adaptation.dynamic_psp import (
+    activate_context_residuals,
+    get_context_manifest,
+)
+from context_adaptation.model_adapter import (
+    ContextAwareModelAdapter,
+    configure_residual_only_training,
+    freeze_encoder_batch_stats,
+)
+from context_adaptation.runtime import load_yaml, write_single_context_runtime_config
+from context_adaptation.stream import (
+    StreamSegment,
+    iter_stream_batches,
+    load_stream_manifest,
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Automatic-context supervised online adaptation for PSP ASF."
+    )
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="ASF config used to build the model and default stream dataset.",
+    )
+    parser.add_argument(
+        "--init_context_checkpoint",
+        required=True,
+        help="Bootstrap checkpoint or a resumable automatic-context checkpoint.",
+    )
+    parser.add_argument(
+        "--context_config",
+        default="./configs/context_adaptation/auto_context_rp2.yml",
+    )
+    parser.add_argument("--stream_config", default=None)
+    parser.add_argument("--output_root", default="./results/ContextAdaptation")
+    parser.add_argument("--run_name", default="auto_context_online")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--max_steps", type=int, default=-1)
+    parser.add_argument(
+        "--save_every_updates",
+        type=int,
+        default=None,
+        help="Override CHECKPOINT.SAVE_EVERY_UPDATES. Zero disables periodic saves.",
+    )
+    parser.add_argument("--optimizer", choices=["adam", "adamw", "sgd"], default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--weight_decay", type=float, default=None)
+    parser.add_argument("--momentum", type=float, default=None)
+    parser.add_argument("--grad_clip", type=float, default=None)
+    parser.add_argument(
+        "--routing_only",
+        action="store_true",
+        help="Discover and route contexts without updating detection parameters.",
+    )
+    return parser.parse_args()
+
+
+def timestamp_now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def build_optimizer(
+    network: torch.nn.Module,
+    context_memory: Any,
+    *,
+    trainable_scope: str,
+    optimizer_name: str,
+    learning_rate: float,
+    weight_decay: float,
+    momentum: float,
+) -> torch.optim.Optimizer:
+    context_groups = []
+    for entry in context_memory.contexts.values():
+        _, parameters = activate_context_residuals(
+            network,
+            entry.model_context_name,
+            trainable_scope=trainable_scope,
+        )
+        context_groups.append((entry.model_context_name, list(parameters)))
+    if not context_groups:
+        raise RuntimeError("Context Memory contains no optimizer parameter groups.")
+
+    first_name, first_parameters = context_groups[0]
+    if optimizer_name == "adam":
+        optimizer = torch.optim.Adam(
+            first_parameters,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+    elif optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            first_parameters,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+    elif optimizer_name == "sgd":
+        optimizer = torch.optim.SGD(
+            first_parameters,
+            lr=learning_rate,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+    optimizer.param_groups[0]["context_name"] = first_name
+    for context_name, parameters in context_groups[1:]:
+        optimizer.add_param_group(
+            {
+                "params": parameters,
+                "context_name": context_name,
+            }
+        )
+    active = context_memory.active
+    if active is None:
+        raise RuntimeError("Context Memory has no active context.")
+    activate_context_residuals(
+        network,
+        active.model_context_name,
+        trainable_scope=trainable_scope,
+    )
+    return optimizer
+
+
+def append_routing_row(path: Path, row: dict[str, Any]) -> None:
+    fields = [
+        "timestamp",
+        "step_idx",
+        "update_idx",
+        "segment_index",
+        "segment_name_for_metrics_only",
+        "segment_local_step",
+        "status",
+        "reason",
+        "active_context_id",
+        "active_context_name",
+        "active_context_lifecycle",
+        "model_update_enabled",
+        "best_context_id",
+        "best_score",
+        "second_score",
+        "best_confidence",
+        "second_confidence",
+        "historical_evidence",
+        "novelty_strength",
+        "novelty_evidence",
+        "candidate_evidence",
+        "raw_projected_feature_json",
+        "smoothed_projected_feature_json",
+        "scores_json",
+        "thresholds_json",
+        "density_thresholds_json",
+        "routing_thresholds_json",
+        "near_thresholds_json",
+        "update_thresholds_json",
+        "created_context_id",
+        "created_context_name",
+        "context_promoted",
+        "model_updated",
+        "memory_updated",
+        "loss",
+        "grad_norm",
+        "elapsed_sec",
+    ]
+    is_new = not path.exists()
+    with path.open("a", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=fields)
+        if is_new:
+            writer.writeheader()
+        writer.writerow({field: row.get(field, "") for field in fields})
+
+
+def clear_batch(batch: Any) -> None:
+    if not isinstance(batch, dict):
+        return
+    if "pointer" in batch:
+        for item in batch["pointer"]:
+            if not isinstance(item, dict):
+                continue
+            for key in list(item):
+                if key != "meta":
+                    item[key] = None
+    for key in list(batch):
+        batch[key] = None
+
+
+def gradient_norm(parameters: Iterable[torch.nn.Parameter]) -> float:
+    total = 0.0
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        value = float(parameter.grad.detach().norm(2).item())
+        total += value * value
+    return total**0.5
+
+
+def select_loss(pipeline: Any, adapter: ContextAwareModelAdapter, output: Any) -> torch.Tensor:
+    if pipeline.get_loss_from == "head":
+        return pipeline.network.head.loss(output)
+    if pipeline.get_loss_from == "detector":
+        return adapter.loss(output)
+    raise RuntimeError(f"Unsupported get_loss_from={pipeline.get_loss_from}")
+
+
+def close_writers(pipeline: Any) -> None:
+    for writer_name in ("log_train_iter", "log_train_epoch", "log_test"):
+        writer = getattr(pipeline, writer_name, None)
+        if writer is not None:
+            writer.close()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.batch_size != 1:
+        raise ValueError("Automatic frame routing currently requires batch_size=1.")
+    if args.num_workers < 0:
+        raise ValueError("num_workers must be nonnegative.")
+    if args.max_steps == 0 or args.max_steps < -1:
+        raise ValueError("max_steps must be -1 or a positive integer.")
+
+    context_config = load_yaml(args.context_config)
+    online_config = context_config["ONLINE"]
+    checkpoint_config = context_config.get("CHECKPOINT", {})
+    trainable_scope = str(online_config.get("TRAINABLE_SCOPE", "fuser_head"))
+    optimizer_name = str(args.optimizer or online_config.get("OPTIMIZER", "adamw"))
+    learning_rate = float(args.lr if args.lr is not None else online_config.get("LR", 1e-4))
+    weight_decay = float(
+        args.weight_decay
+        if args.weight_decay is not None
+        else online_config.get("WEIGHT_DECAY", 0.0)
+    )
+    momentum = float(
+        args.momentum if args.momentum is not None else online_config.get("MOMENTUM", 0.9)
+    )
+    grad_clip = float(
+        args.grad_clip if args.grad_clip is not None else online_config.get("GRAD_CLIP", 0.0)
+    )
+    save_every = int(
+        args.save_every_updates
+        if args.save_every_updates is not None
+        else checkpoint_config.get("SAVE_EVERY_UPDATES", 50)
+    )
+    update_returned = bool(online_config.get("UPDATE_RETURNED_CONTEXT", True))
+    update_memory = bool(online_config.get("UPDATE_MEMORY_IF_CONFIDENT", True))
+    router_config = context_config.get("ROUTER", {})
+    update_threshold_scale = float(
+        router_config.get("UPDATE_THRESHOLD_SCALE", 1.0)
+    )
+    if update_threshold_scale <= 0:
+        raise ValueError("ROUTER.UPDATE_THRESHOLD_SCALE must be positive.")
+
+    payload = load_context_checkpoint(args.init_context_checkpoint, map_location="cpu")
+    manifest = tuple(str(name) for name in payload["context_manifest"])
+    if not manifest:
+        raise RuntimeError("Initial context checkpoint has an empty manifest.")
+    runtime_path, _ = write_single_context_runtime_config(
+        args.config,
+        model_context_name=manifest[0],
+        output_root=args.output_root,
+        run_name=args.run_name,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        enable_logging=True,
+        enable_validation=False,
+    )
+
+    from pipelines.pipeline_detection_v1_0 import PipelineDetection_v1_0
+
+    pipeline = None
+    start_time = time.time()
+    try:
+        pipeline = PipelineDetection_v1_0(path_cfg=runtime_path, mode="train")
+        shutil.copy2(os.path.realpath(__file__), Path(pipeline.path_log) / "executed_code.txt")
+        memory, router, projector = restore_model_and_context_state(
+            pipeline.network,
+            payload,
+            trainable_scope=trainable_scope,
+        )
+        if update_returned:
+            for entry in memory.contexts.values():
+                entry.model_update_enabled = True
+        training_info = configure_residual_only_training(
+            pipeline.network,
+            trainable_scope=trainable_scope,
+        )
+        optimizer = build_optimizer(
+            pipeline.network,
+            memory,
+            trainable_scope=trainable_scope,
+            optimizer_name=optimizer_name,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            momentum=momentum,
+        )
+        optimizer_state = payload.get("optimizer_state_dict", None)
+        if optimizer_state is not None:
+            validate_optimizer_resume(optimizer, payload)
+            optimizer.load_state_dict(optimizer_state)
+            print("* Restored optimizer state.")
+
+        if args.stream_config:
+            segments = load_stream_manifest(args.stream_config, repository_root=ROOT)
+        else:
+            segments = [
+                StreamSegment(
+                    config_path=str(Path(args.config).resolve()),
+                    split="train",
+                    name_for_metrics_only="stream",
+                )
+            ]
+        overrides = {}
+        if (
+            segments[0].split == "train"
+            and Path(segments[0].config_path).resolve() == Path(args.config).resolve()
+        ):
+            overrides[0] = pipeline.dataset_train
+
+        run_path = Path(pipeline.path_log)
+        model_path = run_path / "models"
+        model_path.mkdir(parents=True, exist_ok=True)
+        routing_csv = run_path / "routing_log.csv"
+        run_meta = {
+            "config": str(Path(args.config).resolve()),
+            "context_config": str(Path(args.context_config).resolve()),
+            "init_context_checkpoint": str(Path(args.init_context_checkpoint).resolve()),
+            "stream_config": None if not args.stream_config else str(Path(args.stream_config).resolve()),
+            "trainable_scope": trainable_scope,
+            "optimizer": optimizer_name,
+            "lr": learning_rate,
+            "weight_decay": weight_decay,
+            "momentum": momentum,
+            "grad_clip": grad_clip,
+            "save_every_updates": save_every,
+            "routing_only": bool(args.routing_only),
+            "update_returned_context": update_returned,
+            "update_memory_if_confident": update_memory,
+            "update_threshold_scale": update_threshold_scale,
+            "projection_dim": projector.projection_dim,
+            "initial_context_manifest": list(get_context_manifest(pipeline.network)),
+            "training_info": {
+                "total_parameters": training_info.total_parameters,
+                "trainable_parameters": training_info.trainable_parameters,
+            },
+        }
+        with (run_path / "run_meta.yml").open("w") as output:
+            yaml.safe_dump(run_meta, output, sort_keys=False)
+
+        step_idx = int(payload.get("step_idx", 0))
+        update_idx = int(payload.get("update_idx", 0))
+        initial_update_idx = update_idx
+        stream = iter_stream_batches(
+            segments,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            dataset_overrides=overrides,
+        )
+        progress = tqdm(stream, desc="* Automatic context stream")
+        for stream_batch in progress:
+            if args.max_steps > 0 and step_idx - int(payload.get("step_idx", 0)) >= args.max_steps:
+                clear_batch(stream_batch.batch)
+                break
+            step_idx += 1
+            batch = stream_batch.batch
+            if args.routing_only:
+                pipeline.network.eval()
+            else:
+                pipeline.network.train()
+                freeze_encoder_batch_stats(pipeline.network)
+            encoded = ContextAwareModelAdapter(pipeline.network).encode(batch)
+            projected = projector.transform_batch(encoded)
+            if projected.shape != (1, projector.projection_dim):
+                raise RuntimeError(
+                    f"Online router expected one feature; got {projected.shape}."
+                )
+            raw_x_t = projected[0]
+            x_t = router.prepare_feature(raw_x_t)
+            scores = memory.score_all(x_t)
+            density_thresholds = memory.density_thresholds()
+            routing_thresholds = memory.routing_thresholds(
+                router.routing_threshold_scale
+            )
+            near_thresholds = memory.near_thresholds(router.near_threshold_scale)
+            update_thresholds = memory.update_thresholds(update_threshold_scale)
+            decision = router.step(
+                x_t,
+                scores,
+                density_thresholds,
+                routing_thresholds=routing_thresholds,
+                near_thresholds=near_thresholds,
+                context_lifecycles=memory.context_lifecycles(),
+            )
+
+            created_context_id = None
+            created_context_name = None
+            context_id = decision.context_id
+            should_update_model = decision.should_update_model
+            should_update_memory = decision.should_update_memory and update_memory
+            if decision.status == "create":
+                if decision.candidate_features is None:
+                    raise RuntimeError("Create decision has no candidate features.")
+                entry, _ = create_context_transaction(
+                    network=pipeline.network,
+                    optimizer=optimizer,
+                    memory=memory,
+                    router=router,
+                    initial_features=decision.candidate_features,
+                    created_step=step_idx,
+                    trainable_scope=trainable_scope,
+                    learning_rate=learning_rate,
+                )
+                context_id = entry.context_id
+                created_context_id = entry.context_id
+                created_context_name = entry.context_name
+                should_update_model = True
+                should_update_memory = False
+                save_context_checkpoint(
+                    model_path / f"context_created_{entry.context_id:04d}.checkpoint",
+                    network=pipeline.network,
+                    context_memory=memory,
+                    router=router,
+                    projector=projector,
+                    optimizer=optimizer,
+                    step_idx=step_idx,
+                    update_idx=update_idx,
+                    metadata={"event": "context_created"},
+                )
+
+            loss_value = None
+            norm_value = None
+            model_updated = False
+            memory_updated = False
+            context_promoted = False
+            if context_id is None:
+                raise RuntimeError("Router did not provide an active context.")
+            active_entry = memory.activate(context_id, step=step_idx)
+            if router.active_context_id != context_id:
+                raise RuntimeError("Router and Context Memory selected different contexts.")
+
+            if decision.status == "switch" and created_context_id is None:
+                active_entry.model_update_enabled = update_returned
+            should_update_model = (
+                should_update_model
+                and active_entry.model_update_enabled
+                and not args.routing_only
+            )
+            should_update_memory = should_update_memory and context_id in scores
+            if should_update_model:
+                _, active_parameters = activate_context_residuals(
+                    pipeline.network,
+                    active_entry.model_context_name,
+                    trainable_scope=trainable_scope,
+                )
+                optimizer.zero_grad(set_to_none=True)
+                output = ContextAwareModelAdapter(pipeline.network).forward_with_context(
+                    encoded,
+                    active_entry.model_context_name,
+                )
+                loss = select_loss(pipeline, ContextAwareModelAdapter(pipeline.network), output)
+                loss_value = float(loss.detach().cpu().item())
+                if not torch.isfinite(loss):
+                    raise RuntimeError(
+                        f"Non-finite online loss at step={step_idx}: {loss_value}"
+                    )
+                loss.backward()
+                norm_value = gradient_norm(active_parameters)
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(active_parameters, grad_clip)
+                optimizer.step()
+                update_idx += 1
+                model_updated = True
+            else:
+                if not args.routing_only:
+                    pipeline.network.eval()
+                    ContextAwareModelAdapter(pipeline.network).infer_with_context(
+                        encoded,
+                        active_entry.model_context_name,
+                    )
+
+            if should_update_memory:
+                if active_entry.is_provisional:
+                    context_promoted = memory.update_provisional(
+                        context_id,
+                        x_t,
+                        step=step_idx,
+                        pre_update_score=scores[context_id],
+                    )
+                    memory_updated = True
+                else:
+                    memory_updated = memory.update_stable_if_confident(
+                        context_id,
+                        x_t,
+                        threshold_scale=update_threshold_scale,
+                        step=step_idx,
+                        pre_update_score=scores[context_id],
+                    )
+            elif (
+                update_memory
+                and active_entry.is_provisional
+                and decision.reason == "provisional_context_mismatch"
+            ):
+                memory.mark_provisional_mismatch(context_id)
+                if memory.should_promote(context_id):
+                    memory.promote_context(context_id)
+                    context_promoted = True
+
+            append_routing_row(
+                routing_csv,
+                {
+                    "timestamp": timestamp_now(),
+                    "step_idx": step_idx,
+                    "update_idx": update_idx,
+                    "segment_index": stream_batch.segment_index,
+                    "segment_name_for_metrics_only": stream_batch.segment_name_for_metrics_only,
+                    "segment_local_step": stream_batch.local_step,
+                    "status": decision.status,
+                    "reason": decision.reason,
+                    "active_context_id": context_id,
+                    "active_context_name": active_entry.context_name,
+                    "active_context_lifecycle": active_entry.lifecycle,
+                    "model_update_enabled": int(active_entry.model_update_enabled),
+                    "best_context_id": decision.best_context_id,
+                    "best_score": decision.best_score,
+                    "second_score": decision.second_score,
+                    "best_confidence": decision.best_confidence,
+                    "second_confidence": decision.second_confidence,
+                    "historical_evidence": decision.historical_evidence,
+                    "novelty_strength": decision.novelty_strength,
+                    "novelty_evidence": decision.novelty_evidence,
+                    "candidate_evidence": decision.candidate_evidence,
+                    "raw_projected_feature_json": json.dumps(raw_x_t.tolist()),
+                    "smoothed_projected_feature_json": json.dumps(x_t.tolist()),
+                    "scores_json": json.dumps(scores, sort_keys=True),
+                    "thresholds_json": json.dumps(
+                        density_thresholds, sort_keys=True
+                    ),
+                    "density_thresholds_json": json.dumps(
+                        density_thresholds, sort_keys=True
+                    ),
+                    "routing_thresholds_json": json.dumps(
+                        routing_thresholds, sort_keys=True
+                    ),
+                    "near_thresholds_json": json.dumps(
+                        near_thresholds, sort_keys=True
+                    ),
+                    "update_thresholds_json": json.dumps(
+                        update_thresholds, sort_keys=True
+                    ),
+                    "created_context_id": created_context_id,
+                    "created_context_name": created_context_name,
+                    "context_promoted": int(context_promoted),
+                    "model_updated": int(model_updated),
+                    "memory_updated": int(memory_updated),
+                    "loss": loss_value,
+                    "grad_norm": norm_value,
+                    "elapsed_sec": time.time() - start_time,
+                },
+            )
+            if save_every > 0 and model_updated and update_idx % save_every == 0:
+                save_context_checkpoint(
+                    model_path / f"update_{update_idx:06d}.checkpoint",
+                    network=pipeline.network,
+                    context_memory=memory,
+                    router=router,
+                    projector=projector,
+                    optimizer=optimizer,
+                    step_idx=step_idx,
+                    update_idx=update_idx,
+                    metadata={"event": "periodic_update"},
+                )
+            progress.set_postfix(
+                context=context_id,
+                status=decision.status,
+                updates=update_idx,
+                loss="-" if loss_value is None else f"{loss_value:.4f}",
+            )
+            clear_batch(batch)
+
+        last_path = save_context_checkpoint(
+            model_path / "last.context.checkpoint",
+            network=pipeline.network,
+            context_memory=memory,
+            router=router,
+            projector=projector,
+            optimizer=optimizer,
+            step_idx=step_idx,
+            update_idx=update_idx,
+            metadata={"event": "last"},
+        )
+        print(f"* Stream steps this run = {step_idx - int(payload.get('step_idx', 0))}")
+        print(f"* Model updates this run = {update_idx - initial_update_idx}")
+        print(f"* Final context manifest = {list(get_context_manifest(pipeline.network))}")
+        print(f"* Last checkpoint = {last_path}")
+        print(f"* Routing log = {routing_csv}")
+    finally:
+        if pipeline is not None:
+            close_writers(pipeline)
+        if os.path.exists(runtime_path):
+            os.unlink(runtime_path)
+
+
+if __name__ == "__main__":
+    main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

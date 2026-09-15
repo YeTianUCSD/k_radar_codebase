@@ -66,7 +66,7 @@ def collect_checkpoints(args):
     return sorted(set(paths), key=checkpoint_sort_key)
 
 
-def make_runtime_config(path_config, output_root, run_name, best_metric):
+def make_runtime_config(path_config, output_root, run_name, best_metric, dataset_portion=None):
     with open(path_config, 'r') as f:
         cfg = yaml.safe_load(f)
 
@@ -74,6 +74,8 @@ def make_runtime_config(path_config, output_root, run_name, best_metric):
     cfg['GENERAL']['LOGGING']['PATH_LOGGING'] = output_root
     cfg['GENERAL']['LOGGING']['IS_SAVE_MODEL'] = False
     cfg['VAL']['IS_VALIDATE'] = True
+    if dataset_portion is not None:
+        cfg['DATASET']['portion'] = [str(sequence) for sequence in dataset_portion]
     cfg['GENERAL']['LOGGING']['BEST_METRIC'] = best_metric
 
     tmp = tempfile.NamedTemporaryFile(
@@ -91,6 +93,48 @@ def timestamp_now():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 
+def normalize_sequence(sequence):
+    value = str(sequence).lower(); value = value[3:] if value.startswith('seq') else value
+    return str(int(value))
+
+
+def collect_train_sample_counts(path_config, sequences):
+    from easydict import EasyDict
+    import datasets
+    from utils.util_config import cfg_from_yaml_file
+
+    cfg = cfg_from_yaml_file(path_config, EasyDict())
+    cfg.DATASET.portion = list(sequences)
+    print(f'* Counting effective train samples for sequences: {list(sequences)}')
+    dataset = datasets.__all__[cfg.DATASET.NAME](cfg=cfg, split='train')
+    print(f'* Effective joint-train dataset size: {len(dataset)}')
+    counts = {sequence: 0 for sequence in sequences}
+    for item in dataset.list_dict_item:
+        sequence = normalize_sequence(item['meta']['seq'])
+        if sequence in counts:
+            counts[sequence] += 1
+    return counts
+
+
+def read_training_timing(path_csv):
+    fields = [
+        'train_time_sec', 'save_time_sec', 'eval_subset_time_sec',
+        'eval_full_time_sec', 'best_update_time_sec', 'epoch_time_sec',
+    ]
+    totals = {field: 0.0 for field in fields}
+    totals['epochs'] = 0
+    if not path_csv:
+        return totals
+    with open(path_csv, newline='') as f:
+        for row in csv.DictReader(f):
+            totals['epochs'] += 1
+            for field in fields:
+                value = row.get(field, '')
+                if value not in ('', None):
+                    totals[field] += float(value)
+    return totals
+
+
 def summarize_metrics(
     pline,
     eval_rows,
@@ -98,6 +142,7 @@ def summarize_metrics(
     config_path,
     checkpoint_path,
     timing=None,
+    metadata=None,
 ):
     score = pline.pick_best_metric_score(eval_rows)
     metric_cfg = pline.best_metric_cfg
@@ -130,6 +175,8 @@ def summarize_metrics(
     }
     if timing:
         summary.update(timing)
+    if metadata:
+        summary.update(metadata)
     summary.update(metric_values)
     return summary
 
@@ -138,6 +185,7 @@ def write_csv(path_csv, rows):
     os.makedirs(os.path.dirname(path_csv), exist_ok=True)
     base_fieldnames = [
         'eval_name',
+        'scene',
         'config',
         'checkpoint',
         'checkpoint_name',
@@ -152,6 +200,10 @@ def write_csv(path_csv, rows):
         'load_model_time_sec',
         'eval_time_sec',
         'total_time_sec',
+        'train_samples',
+        'train_fraction',
+        'estimated_train_time_sec',
+        'test_samples',
         'log_dir',
     ]
     metric_fieldnames = sorted({
@@ -163,6 +215,44 @@ def write_csv(path_csv, rows):
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def write_scene_aggregate(path_csv, rows, training_timing, training_wall_time_sec=None):
+    path_aggregate = os.path.splitext(path_csv)[0] + '_aggregate.csv'
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row['checkpoint'], []).append(row)
+
+    aggregate_rows = []
+    for checkpoint, checkpoint_rows in grouped.items():
+        scores = [float(row['score']) for row in checkpoint_rows if row['score'] != '']
+        aggregate_rows.append({
+            'checkpoint': checkpoint,
+            'checkpoint_name': checkpoint_rows[0]['checkpoint_name'],
+            'num_scenes': len(checkpoint_rows),
+            'macro_score': '' if not scores else sum(scores) / len(scores),
+            'training_epochs': training_timing['epochs'],
+            'total_train_samples': sum(int(row.get('train_samples', 0)) for row in checkpoint_rows),
+            'pure_train_time_sec': training_timing['train_time_sec'],
+            'training_save_time_sec': training_timing['save_time_sec'],
+            'training_eval_time_sec': (
+                training_timing['eval_subset_time_sec'] + training_timing['eval_full_time_sec']
+            ),
+            'training_epoch_time_sec': training_timing['epoch_time_sec'],
+            'training_wall_time_sec': '' if training_wall_time_sec is None else training_wall_time_sec,
+            'total_test_samples': sum(int(row.get('test_samples', 0)) for row in checkpoint_rows),
+            'total_scene_setup_time_sec': sum(float(row['setup_time_sec']) for row in checkpoint_rows),
+            'total_model_load_time_sec': sum(float(row['load_model_time_sec']) for row in checkpoint_rows),
+            'total_eval_time_sec': sum(float(row['eval_time_sec']) for row in checkpoint_rows),
+            'total_scene_time_sec': sum(float(row['total_time_sec']) for row in checkpoint_rows),
+        })
+
+    if not aggregate_rows:
+        return
+    with open(path_aggregate, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(aggregate_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(aggregate_rows)
 
 
 def write_comparison(path_csv, rows):
@@ -228,6 +318,12 @@ def main():
     parser.add_argument('--print_memory', action='store_true')
     parser.add_argument('--hd_memory', type=str, default=None,
                         help='Optional HD memory path loaded after each model checkpoint. Use with AnchorHeadSingleHD configs.')
+    parser.add_argument('--sequences', type=str, nargs='+', default=None,
+                        help='Evaluate one config separately per sequence by overriding DATASET.portion')
+    parser.add_argument('--training_summary_csv', type=str, default=None,
+                        help='Optional train_summary.csv used for training-time accounting')
+    parser.add_argument('--training_wall_time_sec', type=float, default=None,
+                        help='Optional wall-clock duration of the training process')
     args = parser.parse_args()
 
     if args.checkpoints is None and args.checkpoint_dir is None:
@@ -238,7 +334,24 @@ def main():
         raise FileNotFoundError('No checkpoints found')
 
     eval_items = [parse_eval_item(item) for item in args.eval]
+    sequences = None
+    if args.sequences:
+        if len(eval_items) != 1:
+            raise ValueError('--sequences requires exactly one --eval config')
+        sequences = []
+        for sequence in args.sequences:
+            normalized = normalize_sequence(sequence)
+            if normalized not in sequences:
+                sequences.append(normalized)
+        _, config_path = eval_items[0]
+        eval_items = [(f'seq{sequence}', config_path, sequence) for sequence in sequences]
+    else:
+        eval_items = [(name, path, None) for name, path in eval_items]
     os.makedirs(args.output_root, exist_ok=True)
+
+    training_timing = read_training_timing(args.training_summary_csv)
+    train_counts = collect_train_sample_counts(eval_items[0][1], sequences) if sequences else {}
+    total_train_samples = sum(train_counts.values())
 
     best_metric = {
         'CLS': args.best_metric_cls,
@@ -252,7 +365,7 @@ def main():
     from pipelines.pipeline_detection_v1_0 import PipelineDetection_v1_0
 
     summary_rows = []
-    for eval_name, config_path in eval_items:
+    for eval_name, config_path, sequence in eval_items:
         for checkpoint_path in checkpoints:
             total_time_start = time.time()
             ckpt_name = os.path.splitext(os.path.basename(checkpoint_path))[0]
@@ -262,6 +375,7 @@ def main():
                 args.output_root,
                 run_name,
                 best_metric,
+                dataset_portion=None if sequence is None else [sequence],
             )
 
             print(f'* Eval {eval_name}: {checkpoint_path}')
@@ -308,6 +422,20 @@ def main():
                     'eval_time_sec': eval_time_sec,
                     'total_time_sec': total_time_sec,
                 },
+                metadata={
+                    'scene': '' if sequence is None else f'seq{sequence}',
+                    'train_samples': train_counts.get(sequence, ''),
+                    'train_fraction': (
+                        '' if sequence is None or total_train_samples == 0
+                        else train_counts[sequence] / total_train_samples
+                    ),
+                    'estimated_train_time_sec': (
+                        '' if sequence is None or total_train_samples == 0
+                        else training_timing['train_time_sec']
+                        * train_counts[sequence] / total_train_samples
+                    ),
+                    'test_samples': len(pline.dataset_test),
+                },
             )
             summary_rows.append(summary)
             print(
@@ -317,6 +445,11 @@ def main():
             print(f"* Selected metrics {eval_name}/{ckpt_name}: {summary['selected_metrics']}")
             print(f"* Selected score values {eval_name}/{ckpt_name}: {summary['selected_score_values']}")
             write_csv(args.summary_csv, summary_rows)
+            if sequences:
+                write_scene_aggregate(
+                    args.summary_csv, summary_rows, training_timing,
+                    args.training_wall_time_sec,
+                )
 
             for writer_name in ('log_train_iter', 'log_train_epoch', 'log_test'):
                 writer = getattr(pline, writer_name, None)
@@ -325,6 +458,11 @@ def main():
 
     write_csv(args.summary_csv, summary_rows)
     write_comparison(args.summary_csv, summary_rows)
+    if sequences:
+        write_scene_aggregate(
+            args.summary_csv, summary_rows, training_timing,
+            args.training_wall_time_sec,
+        )
     print(f'* Summary saved: {args.summary_csv}')
     os._exit(0)
 
